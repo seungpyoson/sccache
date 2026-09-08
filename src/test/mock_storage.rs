@@ -29,6 +29,7 @@ pub struct MockStorage {
     delay: Option<Duration>,
     preprocessor_cache_mode: bool,
     check_error: Option<&'static str>,
+    raw_read: std::result::Result<Option<bytes::Bytes>, &'static str>,
 }
 
 impl MockStorage {
@@ -41,6 +42,7 @@ impl MockStorage {
             delay,
             preprocessor_cache_mode,
             check_error: None,
+            raw_read: Ok(None),
         }
     }
 
@@ -53,10 +55,23 @@ impl MockStorage {
         self.check_error = Some(error);
         self
     }
+
+    pub(crate) fn with_raw_read_error(mut self, error: &'static str) -> Self {
+        self.raw_read = Err(error);
+        self
+    }
+
+    pub(crate) fn with_raw_read_bytes(mut self, bytes: bytes::Bytes) -> Self {
+        self.raw_read = Ok(Some(bytes));
+        self
+    }
 }
 
 #[async_trait]
 impl Storage for MockStorage {
+    async fn get_raw(&self, _key: &str) -> Result<Option<bytes::Bytes>> {
+        self.raw_read.clone().map_err(anyhow::Error::msg)
+    }
     async fn check(&self) -> Result<CacheMode> {
         match self.check_error {
             Some(error) => bail!(error),

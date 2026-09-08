@@ -70,6 +70,8 @@ pub enum Response {
     RecordStats,
     /// A failed capability initialization cannot produce handshake metadata.
     StorageHandshakeError(String),
+    /// A failed raw read is distinct from an absent cache entry.
+    StorageGetRawError(String),
 }
 
 /// Possible responses from the server for a `Compile` request.

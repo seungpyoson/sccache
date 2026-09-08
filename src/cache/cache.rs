@@ -193,6 +193,10 @@ pub struct RemoteStorage {
     /// Successful initialization belongs to this storage instance. Mode queries
     /// must not compete with one another by rewriting the capability probe.
     initialized: tokio::sync::OnceCell<()>,
+    /// One marker per storage instance, retained under the normal cache prefix.
+    /// The backend's cache lifecycle/eviction owns its retention, as for entries.
+    /// Keep the identity across failed or cancelled initialization attempts.
+    write_probe: String,
 }
 
 #[cfg(any(
@@ -213,6 +217,7 @@ impl RemoteStorage {
             basedirs,
             rw_mode,
             initialized: tokio::sync::OnceCell::new(),
+            write_probe: format!(".sccache_check-{}", uuid::Uuid::new_v4()),
         }
     }
 }
@@ -285,14 +290,16 @@ impl Storage for RemoteStorage {
                 }
 
                 if self.rw_mode == CacheMode::ReadWrite {
-                    match operator.write(path, "Hello, World!").await {
+                    match operator.write(&self.write_probe, "Hello, World!").await {
                         Ok(_) => (),
                         // Immutable backends acknowledge an existing probe.
                         // This does not report a fresh cache write.
                         Err(err) if err.kind() == ErrorKind::AlreadyExists => (),
                         Err(err) => {
-                            return Err(err)
-                                .context("cache storage failed to provide requested write access");
+                            let kind = err.kind();
+                            return Err(err).with_context(|| format!(
+                                "cache storage failed to provide requested write access ({kind})"
+                            ));
                         }
                     }
                 }
@@ -657,6 +664,7 @@ mod test {
             initial_write_statuses: Arc<std::sync::Mutex<std::collections::VecDeque<StatusCode>>>,
             reads: Arc<AtomicUsize>,
             writes: Arc<AtomicUsize>,
+            write_paths: Arc<std::sync::Mutex<Vec<String>>>,
         }
 
         impl HttpFetch for ProbeHttp {
@@ -672,6 +680,10 @@ mod test {
                     }
                     Some(Operation::Write) => {
                         self.writes.fetch_add(1, Ordering::SeqCst);
+                        self.write_paths
+                            .lock()
+                            .unwrap()
+                            .push(request.uri().path().to_owned());
                         self.initial_write_statuses
                             .lock()
                             .unwrap()
@@ -699,6 +711,7 @@ mod test {
                 initial_write_statuses: Arc::default(),
                 reads: Arc::default(),
                 writes: Arc::default(),
+                write_paths: Arc::default(),
             };
             let operator = opendal::Operator::new(
                 opendal::services::S3::default()
@@ -783,6 +796,47 @@ mod test {
         }
 
         #[tokio::test]
+        async fn capability_independent_storage_instances_use_distinct_probe_keys() {
+            let (storage, http) =
+                probe_storage(CacheMode::ReadWrite, StatusCode::NOT_FOUND, StatusCode::OK);
+            let instances: Vec<_> = (0..8)
+                .map(|_| RemoteStorage::new(storage.operator.clone(), vec![], CacheMode::ReadWrite))
+                .collect();
+            for result in
+                futures::future::join_all(instances.iter().map(|storage| storage.check())).await
+            {
+                assert_eq!(result.unwrap(), CacheMode::ReadWrite);
+            }
+            let paths = http.write_paths.lock().unwrap();
+            assert_eq!(paths.len(), 8);
+            assert_eq!(
+                paths.iter().collect::<std::collections::HashSet<_>>().len(),
+                8
+            );
+            assert!(
+                paths
+                    .iter()
+                    .all(|path| path.starts_with("/probe-test/cache/"))
+            );
+        }
+
+        #[tokio::test]
+        async fn capability_failed_checks_reuse_the_owned_probe_identity() {
+            let (storage, http) =
+                probe_storage(CacheMode::ReadWrite, StatusCode::NOT_FOUND, StatusCode::OK);
+            http.initial_write_statuses
+                .lock()
+                .unwrap()
+                .push_back(StatusCode::FORBIDDEN);
+            let error = storage.check().await.unwrap_err();
+            assert!(error.to_string().contains("PermissionDenied"));
+            assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+            let paths = http.write_paths.lock().unwrap();
+            assert_eq!(paths.len(), 2);
+            assert_eq!(paths[0], paths[1]);
+        }
+
+        #[tokio::test]
         async fn capability_check_recovers_from_temporary_initial_write_contention() {
             let (storage, http) =
                 probe_storage(CacheMode::ReadWrite, StatusCode::NOT_FOUND, StatusCode::OK);
@@ -805,6 +859,7 @@ mod test {
                 initial_write_statuses: Arc::default(),
                 reads: Arc::default(),
                 writes: Arc::default(),
+                write_paths: Arc::default(),
             };
             let operator = opendal::Operator::new(
                 opendal::services::Ghac::default()

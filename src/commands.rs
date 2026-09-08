@@ -34,7 +34,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use strip_ansi_escapes::Writer;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::{Builder, Runtime};
@@ -86,7 +86,7 @@ async fn read_server_startup_status<R: AsyncReadExt + Unpin>(
 /// Re-execute the current executable as a background server, and wait
 /// for it to start up.
 #[cfg(not(windows))]
-fn run_server_process(startup_timeout: Duration) -> Result<ServerStartup> {
+fn run_server_process(deadline: Instant) -> Result<ServerStartup> {
     trace!("run_server_process");
     let tempdir = tempfile::Builder::new().prefix("sccache").tempdir()?;
     let socket_path = tempdir.path().join("sock");
@@ -120,7 +120,7 @@ fn run_server_process(startup_timeout: Duration) -> Result<ServerStartup> {
     };
 
     runtime.block_on(async move {
-        match tokio::time::timeout(startup_timeout, startup).await {
+        match tokio::time::timeout_at(deadline.into(), startup).await {
             Ok(result) => result,
             Err(_elapsed) => Ok(ServerStartup::TimedOut),
         }
@@ -175,7 +175,7 @@ fn redirect_error_log(f: File) -> Result<()> {
 
 /// Re-execute the current executable as a background server.
 #[cfg(windows)]
-fn run_server_process(startup_timeout: Duration) -> Result<ServerStartup> {
+fn run_server_process(deadline: Instant) -> Result<ServerStartup> {
     use futures::StreamExt;
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
@@ -295,7 +295,7 @@ fn run_server_process(startup_timeout: Duration) -> Result<ServerStartup> {
     };
 
     runtime.block_on(async move {
-        match tokio::time::timeout(startup_timeout, startup).await {
+        match tokio::time::timeout_at(deadline.into(), startup).await {
             Ok(result) => result,
             Err(_elapsed) => Ok(ServerStartup::TimedOut),
         }
@@ -308,16 +308,16 @@ fn connect_or_start_server(
     startup_timeout: Duration,
 ) -> Result<ServerConnection> {
     trace!("connect_or_start_server({addr})");
-    match connect_to_server(addr) {
+    let deadline = Instant::now() + startup_timeout;
+    match connect_to_server(addr, deadline) {
         Ok(server) => Ok(server),
         Err(ref e)
-            if (e.kind() == io::ErrorKind::ConnectionRefused
-                || e.kind() == io::ErrorKind::TimedOut)
+            if e.kind() == io::ErrorKind::ConnectionRefused
                 || (e.kind() == io::ErrorKind::NotFound && addr.is_unix_path()) =>
         {
             // If the connection was refused we probably need to start
             // the server.
-            match run_server_process(startup_timeout)? {
+            match run_server_process(deadline)? {
                 ServerStartup::Ok { addr: actual_addr } => {
                     if addr.to_string() != actual_addr {
                         // bail as the next connect_with_retry will fail
@@ -335,7 +335,7 @@ fn connect_or_start_server(
                     reason
                 ),
             }
-            let server = connect_with_retry(addr)?;
+            let server = connect_with_retry(addr, deadline)?;
             Ok(server)
         }
         Err(e) => Err(e.into()),
@@ -704,15 +704,21 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::ShowStats(fmt, advanced) => {
             trace!("Command::ShowStats({:?})", fmt);
-            let stats = match connect_to_server(&get_addr()) {
+            let stats = match connect_to_server(&get_addr(), Instant::now() + startup_timeout) {
                 Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
                 // If there is no server, spawning a new server would start with zero stats
                 // anyways, so we can just return (mostly) empty stats directly.
-                Err(_) => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                    ) =>
+                {
                     let runtime = new_client_runtime()?;
                     let storage = storage_from_config(config, runtime.handle()).ok();
                     runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
                 }
+                Err(error) => return Err(error).context("failed to establish server readiness"),
             };
             match fmt {
                 StatsFormat::Text => stats.print(advanced),
@@ -753,8 +759,8 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::StartServer => {
             trace!("Command::StartServer");
             println!("sccache: Starting the server...");
-            let startup =
-                run_server_process(startup_timeout).context("failed to start server process")?;
+            let startup = run_server_process(Instant::now() + startup_timeout)
+                .context("failed to start server process")?;
             match startup {
                 ServerStartup::Ok { addr } => {
                     println!("sccache: Listening on address {addr}");
@@ -767,7 +773,8 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::StopServer => {
             trace!("Command::StopServer");
             println!("Stopping sccache server...");
-            let server = connect_to_server(&get_addr()).context("couldn't connect to server")?;
+            let server = connect_to_server(&get_addr(), Instant::now() + startup_timeout)
+                .context("couldn't connect to server")?;
             let stats = request_shutdown(server)?;
             stats.print(false);
         }

@@ -6,6 +6,21 @@ computing some hashes to make sure the input is the same.
 Because the configuration and environment matter, the hash
 computation takes a few parameters into account.
 
+## Remote storage initialization
+
+A daemon verifies its configured remote read access before serving requests.
+Read/write storage also writes one small marker with an identity owned by that
+storage instance. Independent daemons use different marker keys; retries reuse
+the same key, and a successful check is reused for subsequent client handshakes.
+Read-only storage never writes a marker.
+
+Markers live under the configured cache prefix and use the backend's ordinary
+cache expiration or eviction policy. Repeated daemon restarts can therefore add
+markers even when the compilation workload is unchanged. Include the whole
+cache prefix in a finite retention policy when bounded storage is required;
+backends configured without expiration or eviction retain markers indefinitely.
+Initialization does not require DELETE permission or a separate cleanup process.
+
 ## How hash keys are computed.
 
 ### Rust

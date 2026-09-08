@@ -506,7 +506,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
             Ok(())
         }
         Err(e) => {
-            error!("failed to start server: {}", e);
+            error!("failed to start server: {e}");
             let io_error = e.downcast_ref::<io::Error>();
             if io_error.is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse) {
                 notify_server_startup(notify.as_ref(), ServerStartup::AddrInUse)?;
@@ -600,6 +600,9 @@ fn bind_unix_listener(
                 ));
             }
             std::fs::remove_file(path)?;
+        }
+        Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+            return Err(io::ErrorKind::AddrInUse.into());
         }
         Some(Err(error)) => return Err(error),
         Some(Ok(_)) | None => return Err(io::ErrorKind::AddrInUse.into()),
@@ -900,7 +903,6 @@ where
             match req.into_inner() {
                 Request::Compile(compile) => {
                     debug!("handle_client: compile");
-                    me.stats.lock().await.compile_requests += 1;
                     me.handle_compile(compile).await
                 }
                 Request::GetStats => {
@@ -971,7 +973,7 @@ where
                         Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
                         Err(e) => {
                             warn!("storage_get_raw error: {e:#}");
-                            Response::StorageGetRaw(None)
+                            Response::StorageGetRawError(format!("{e:#}"))
                         }
                     };
                     Ok(Message::WithoutBody(resp))
@@ -1220,6 +1222,7 @@ where
     /// the initial information and an optional body which will eventually
     /// contain the results of the compilation.
     async fn handle_compile(&self, compile: Compile) -> Result<SccacheResponse> {
+        self.stats.lock().await.compile_requests += 1;
         let exe = compile.exe;
         let cmd = compile.args;
         let cwd: PathBuf = compile.cwd.into();
@@ -2631,6 +2634,125 @@ mod tests {
                 assert_eq!(error, "write permission denied");
             }
             _ => panic!("failed capability did not produce a handshake error response"),
+        }
+    }
+
+    async fn read_entry_over_ipc(storage: impl Storage + 'static) -> Result<crate::cache::Cache> {
+        use crate::cache::IpcStorage;
+        use crate::client::ServerConnection;
+        use crate::mock_command::MockCommandCreator;
+        let jobserver = Client::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_wait, info) = WaitUntilZero::new();
+        let service = SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::new(
+            DistClientContainer::new_disabled(),
+            Arc::new(storage),
+            &jobserver,
+            tokio::runtime::Handle::current(),
+            tx,
+            info,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            service.bind(socket).await.unwrap();
+        });
+        let result = tokio::task::spawn_blocking(move || {
+            let stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let storage =
+                IpcStorage::connect(ServerConnection::new(Box::new(stream)).unwrap()).unwrap();
+            crate::util::new_client_runtime()
+                .unwrap()
+                .block_on(storage.get("entry"))
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn capability_remote_read_error_survives_the_real_ipc_transport() {
+        let storage = crate::test::mock_storage::MockStorage::new(None, false)
+            .with_raw_read_error("remote read permission denied");
+        let error = read_entry_over_ipc(storage).await.unwrap_err();
+        assert_eq!(error.to_string(), "remote read permission denied");
+    }
+
+    #[tokio::test]
+    async fn capability_ipc_rejects_corrupt_raw_entry() {
+        let storage = crate::test::mock_storage::MockStorage::new(None, false)
+            .with_raw_read_bytes(bytes::Bytes::from_static(b"invalid cache archive"));
+        let error = read_entry_over_ipc(storage).await.unwrap_err();
+        assert!(error.is::<zip::result::ZipError>(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn capability_ipc_rejects_corrupt_file_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::cache::disk::DiskCache::new(
+            directory.path(),
+            u64::MAX,
+            &tokio::runtime::Handle::current(),
+            crate::config::PreprocessorCacheModeConfig::default(),
+            CacheMode::ReadWrite,
+            vec![],
+        );
+        storage
+            .put_raw("entry", bytes::Bytes::from_static(b"invalid cache archive"))
+            .await
+            .unwrap();
+        let error = read_entry_over_ipc(storage).await.unwrap_err();
+        assert!(error.is::<zip::result::ZipError>(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn capability_compile_requests_are_counted_once_in_both_modes() {
+        use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+        use crate::test::mock_storage::MockStorage;
+
+        let jobserver = Client::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_wait, info) = WaitUntilZero::new();
+        let service = Arc::new(
+            SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::new(
+                DistClientContainer::new_disabled(),
+                Arc::new(MockStorage::new(None, false)),
+                &jobserver,
+                tokio::runtime::Handle::current(),
+                tx,
+                info,
+            ),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("unsupported-compiler");
+        std::fs::write(&executable, "fixture").unwrap();
+        for direct in [false, true] {
+            {
+                let mut creator = service.creator.lock().unwrap();
+                creator.next_command_spawns(Ok(MockChild::new(exit_status(1), "hello", "error")));
+                creator.next_command_spawns(Ok(MockChild::new(exit_status(0), "hello", "error")));
+            }
+            let compile = Compile {
+                exe: executable.as_os_str().to_owned(),
+                cwd: temp.path().as_os_str().to_owned(),
+                args: vec![],
+                env_vars: vec![],
+            };
+            if direct {
+                service.compile_direct(compile).await.unwrap();
+            } else {
+                service
+                    .clone()
+                    .call(Message::WithoutBody(Request::Compile(compile)))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(service.take_stats().await.compile_requests, 1);
         }
     }
 

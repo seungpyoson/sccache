@@ -13,10 +13,6 @@
 //! The module is used to provide abstraction over TCP socket and UDS.
 
 use std::fmt;
-#[cfg(target_os = "android")]
-use std::os::android::net::SocketAddrExt;
-#[cfg(target_os = "linux")]
-use std::os::linux::net::SocketAddrExt;
 
 use futures::{Future, TryFutureExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -121,26 +117,6 @@ impl Connection for std::net::TcpStream {
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
         let stream = std::net::TcpStream::try_clone(self)?;
         Ok(Box::new(stream))
-    }
-}
-
-// Helper function to create a stream. Uses dynamic dispatch to make code more
-// readable.
-pub fn connect(addr: &SocketAddr) -> std::io::Result<Box<dyn Connection>> {
-    match addr {
-        SocketAddr::Net(addr) => {
-            std::net::TcpStream::connect(addr).map(|s| Box::new(s) as Box<dyn Connection>)
-        }
-        #[cfg(unix)]
-        SocketAddr::Unix(p) => {
-            std::os::unix::net::UnixStream::connect(p).map(|s| Box::new(s) as Box<dyn Connection>)
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        SocketAddr::UnixAbstract(p) => {
-            let sock = std::os::unix::net::SocketAddr::from_abstract_name(p)?;
-            std::os::unix::net::UnixStream::connect_addr(&sock)
-                .map(|s| Box::new(s) as Box<dyn Connection>)
-        }
     }
 }
 

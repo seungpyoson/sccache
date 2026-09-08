@@ -112,7 +112,8 @@ fn test_server_shutdown() {
     let f = TestFixture::new();
     let (addr, _sender, _storage, child) = run_server_thread(f.tempdir.path(), None);
     // Connect to the server.
-    let conn = connect_to_server(&addr).unwrap();
+    let conn =
+        connect_to_server(&addr, std::time::Instant::now() + Duration::from_secs(5)).unwrap();
     // Ask it to shut down
     request_shutdown(conn).unwrap();
     // Ensure that it shuts down.
@@ -132,7 +133,8 @@ fn test_server_shutdown_no_idle() {
         },
     );
 
-    let conn = connect_to_server(&addr).unwrap();
+    let conn =
+        connect_to_server(&addr, std::time::Instant::now() + Duration::from_secs(5)).unwrap();
     request_shutdown(conn).unwrap();
     child.join().unwrap();
 }
@@ -160,7 +162,8 @@ fn test_server_stats() {
     let f = TestFixture::new();
     let (addr, sender, _storage, child) = run_server_thread(f.tempdir.path(), None);
     // Connect to the server.
-    let conn = connect_to_server(&addr).unwrap();
+    let conn =
+        connect_to_server(&addr, std::time::Instant::now() + Duration::from_secs(5)).unwrap();
     // Ask it for stats.
     let info = request_stats(conn).unwrap();
     assert_eq!(0, info.stats.compile_requests);
@@ -177,7 +180,8 @@ fn test_server_unsupported_compiler() {
     let f = TestFixture::new();
     let (addr, sender, server_creator, child) = run_server_thread(f.tempdir.path(), None);
     // Connect to the server.
-    let conn = connect_to_server(&addr).unwrap();
+    let conn =
+        connect_to_server(&addr, std::time::Instant::now() + Duration::from_secs(5)).unwrap();
     {
         let mut c = server_creator.lock().unwrap();
         // fail rust driver check
@@ -233,7 +237,8 @@ fn test_server_compile() {
     const PREPROCESSOR_STDERR: &[u8] = b"preprocessor stderr";
     const STDOUT: &[u8] = b"some stdout";
     const STDERR: &[u8] = b"some stderr";
-    let conn = connect_to_server(&addr).unwrap();
+    let conn =
+        connect_to_server(&addr, std::time::Instant::now() + Duration::from_secs(5)).unwrap();
     // Write a dummy input file so the preprocessor cache mode can work
     std::fs::write(f.tempdir.path().join("file.c"), "whatever").unwrap();
     {
