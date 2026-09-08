@@ -1270,6 +1270,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// Bound both the startup notification wait and the daemon's storage initialization.
+    pub fn server_startup_timeout(&self) -> std::time::Duration {
+        self.server_startup_timeout
+            .unwrap_or(std::time::Duration::from_millis(10000))
+    }
+
     pub fn load() -> Result<Self> {
         let env_conf = config_from_env()?;
 

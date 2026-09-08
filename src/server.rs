@@ -29,7 +29,6 @@ use crate::protocol::{
     Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
 };
 use crate::util;
-#[cfg(feature = "dist-client")]
 use anyhow::Context as _;
 use bytes::{Bytes, BytesMut, buf::BufMut};
 use filetime::FileTime;
@@ -442,102 +441,56 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         });
         panic_hook(info);
     }));
-    let client = Client::new();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(std::cmp::max(20, 2 * util::num_cpus()))
         .build()?;
-    let pool = runtime.handle().clone();
-    let dist_client = DistClientContainer::new(config, &pool);
-
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
-
-    let raw_storage = match storage_from_config(config, &pool) {
-        Ok(storage) => storage,
-        Err(err) => {
-            error!("storage init failed for: {err:?}");
-
-            notify_server_startup(
-                notify.as_ref(),
-                ServerStartup::Err {
-                    reason: err.to_string(),
-                },
-            )?;
-
-            return Err(err);
+    // Only the process owning the endpoint may initialize remote storage.
+    // Parallel local starters use the existing AddrInUse/reconnect path.
+    let res: Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| match addr
+    {
+        crate::net::SocketAddr::Net(addr) => {
+            trace!("binding TCP {addr}");
+            let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
+            let srv = initialize_server(l, runtime, config)?;
+            Ok((
+                srv.local_addr().unwrap(),
+                Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+            ))
         }
-    };
-
-    let cache_mode = runtime.block_on(async {
-        match raw_storage.check().await {
-            Ok(mode) => Ok(mode),
-            Err(err) => {
-                error!("storage check failed for: {err:?}");
-
-                notify_server_startup(
-                    notify.as_ref(),
-                    ServerStartup::Err {
-                        reason: err.to_string(),
-                    },
-                )?;
-
-                Err(err)
-            }
+        #[cfg(unix)]
+        crate::net::SocketAddr::Unix(path) => {
+            trace!("binding unix socket {}", path.display());
+            let (l, endpoint_lock) = {
+                let _guard = runtime.enter();
+                bind_unix_listener(path)?
+            };
+            let srv = initialize_server(l, runtime, config)?;
+            Ok((
+                srv.local_addr().unwrap(),
+                Box::new(move |f| {
+                    let _endpoint_lock = endpoint_lock;
+                    srv.run(f)
+                }) as Box<dyn FnOnce(_) -> _>,
+            ))
         }
-    })?;
-    info!("server has setup with {cache_mode:?}");
-
-    let storage = match cache_mode {
-        CacheMode::ReadOnly => Arc::new(ReadOnlyStorage(raw_storage)),
-        _ => raw_storage,
-    };
-
-    let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| {
-        match addr {
-            crate::net::SocketAddr::Net(addr) => {
-                trace!("binding TCP {addr}");
-                let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                Ok((
-                    srv.local_addr().unwrap(),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
-                ))
-            }
-            #[cfg(unix)]
-            crate::net::SocketAddr::Unix(path) => {
-                trace!("binding unix socket {}", path.display());
-                // Unix socket will report addr in use on any unlink file.
-                let _ = std::fs::remove_file(path);
-                let l = {
-                    let _guard = runtime.enter();
-                    tokio::net::UnixListener::bind(path)?
-                };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                Ok((
-                    srv.local_addr().unwrap(),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
-                ))
-            }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            crate::net::SocketAddr::UnixAbstract(p) => {
-                trace!("binding abstract unix socket {}", p.escape_ascii());
-                let abstract_addr = std::os::unix::net::SocketAddr::from_abstract_name(p)?;
-                let l = std::os::unix::net::UnixListener::bind_addr(&abstract_addr)?;
-                l.set_nonblocking(true)?;
-                let l = {
-                    let _guard = runtime.enter();
-                    tokio::net::UnixListener::from_std(l)?
-                };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                Ok((
-                    srv.local_addr()
-                        .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
-                ))
-            }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        crate::net::SocketAddr::UnixAbstract(p) => {
+            trace!("binding abstract unix socket {}", p.escape_ascii());
+            let abstract_addr = std::os::unix::net::SocketAddr::from_abstract_name(p)?;
+            let l = std::os::unix::net::UnixListener::bind_addr(&abstract_addr)?;
+            l.set_nonblocking(true)?;
+            let l = {
+                let _guard = runtime.enter();
+                tokio::net::UnixListener::from_std(l)?
+            };
+            let srv = initialize_server(l, runtime, config)?;
+            Ok((
+                srv.local_addr()
+                    .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
+                Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+            ))
         }
     })();
     match res {
@@ -554,9 +507,10 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         }
         Err(e) => {
             error!("failed to start server: {}", e);
-            if io::ErrorKind::AddrInUse == e.kind() {
+            let io_error = e.downcast_ref::<io::Error>();
+            if io_error.is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse) {
                 notify_server_startup(notify.as_ref(), ServerStartup::AddrInUse)?;
-            } else if cfg!(windows) && Some(10013) == e.raw_os_error() {
+            } else if cfg!(windows) && io_error.is_some_and(|e| e.raw_os_error() == Some(10013)) {
                 // 10013 is the "WSAEACCES" error, which can occur if the requested port
                 // has been allocated for other purposes, such as winNAT or Hyper-V.
                 let windows_help_message = "A Windows port exclusion is blocking use of the configured port.\nTry setting SCCACHE_SERVER_PORT to a new value.";
@@ -566,9 +520,91 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 let reason = e.to_string();
                 notify_server_startup(notify.as_ref(), ServerStartup::Err { reason })?;
             }
-            Err(e.into())
+            Err(e)
         }
     }
+}
+
+/// Initialize the storage only after the listener has claimed its endpoint.
+fn initialize_server<A: crate::net::Acceptor>(
+    listener: A,
+    runtime: Runtime,
+    config: &Config,
+) -> Result<SccacheServer<A>> {
+    let pool = runtime.handle().clone();
+    let raw_storage = storage_from_config(config, &pool)?;
+    let cache_mode = runtime.block_on(async {
+        tokio::time::timeout(config.server_startup_timeout(), raw_storage.check())
+            .await
+            .context("timed out initializing cache storage")?
+    })?;
+    info!("server has setup with {cache_mode:?}");
+    let storage: Arc<dyn Storage> = match cache_mode {
+        CacheMode::ReadOnly => Arc::new(ReadOnlyStorage(raw_storage)),
+        CacheMode::ReadWrite => raw_storage,
+    };
+    let client = Client::new();
+    let dist_client = DistClientContainer::new(config, &pool);
+    Ok(SccacheServer::with_listener(
+        listener,
+        runtime,
+        client,
+        dist_client,
+        storage,
+    ))
+}
+
+/// Pathname sockets survive a crashed daemon. Serialize their reclamation and
+/// retain ownership until the listener closes; the lock inode must never be removed.
+#[cfg(unix)]
+fn bind_unix_listener(
+    path: &std::path::Path,
+) -> io::Result<(tokio::net::UnixListener, std::fs::File)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock_path)?;
+    if !lock.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix socket lock is not a regular file",
+        ));
+    }
+    // SAFETY: lock owns a valid open descriptor for the entire call and listener lifetime.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(io::ErrorKind::AddrInUse, "Unix socket has an active owner")
+        } else {
+            error
+        });
+    }
+
+    // An older daemon or an unrelated listener may not hold our lock. A pending
+    // connect is also evidence of a live endpoint, never grounds to unlink it.
+    match tokio::net::UnixStream::connect(path).now_or_never() {
+        Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => (),
+        Some(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            if !std::fs::symlink_metadata(path)?.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "Path is not a socket",
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Some(Err(error)) => return Err(error),
+        Some(Ok(_)) | None => return Err(io::ErrorKind::AddrInUse.into()),
+    }
+    Ok((tokio::net::UnixListener::bind(path)?, lock))
 }
 
 pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = ProcessCommandCreator> {
@@ -903,15 +939,25 @@ where
                 }
                 Request::StorageHandshake => {
                     debug!("handle_client: storage_handshake");
-                    let info = StorageHandshakeInfo {
-                        location: me.storage.location(),
-                        cache_type_name: me.storage.cache_type_name().to_owned(),
-                        basedirs: me.storage.basedirs().to_vec(),
-                        preprocessor_cache_mode_config: me.storage.preprocessor_cache_mode_config(),
-                        cache_mode: me.storage.check().await.unwrap_or(CacheMode::ReadWrite),
-                        max_size: me.storage.max_size().await.unwrap_or(None),
+                    let info = async {
+                        Ok(StorageHandshakeInfo {
+                            location: me.storage.location(),
+                            cache_type_name: me.storage.cache_type_name().to_owned(),
+                            basedirs: me.storage.basedirs().to_vec(),
+                            preprocessor_cache_mode_config: me
+                                .storage
+                                .preprocessor_cache_mode_config(),
+                            cache_mode: me.storage.check().await?,
+                            max_size: me.storage.max_size().await.unwrap_or(None),
+                        })
+                    }
+                    .await
+                    .map_err(|error: anyhow::Error| format!("{error:#}"));
+                    let response = match info {
+                        Ok(info) => Response::StorageHandshake(info),
+                        Err(error) => Response::StorageHandshakeError(error),
                     };
-                    Ok(Message::WithoutBody(Response::StorageHandshake(info)))
+                    Ok(Message::WithoutBody(response))
                 }
                 Request::StorageGetPath { key } => {
                     debug!("handle_client: storage_get_path key={}", key);
@@ -2473,6 +2519,120 @@ fn waits_until_zero() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_endpoint_retains_ownership_and_reclaims_after_close() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sock");
+        let first = bind_unix_listener(&path).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        assert_eq!(
+            bind_unix_listener(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        let lock_inode = std::fs::metadata(temp.path().join("sock.lock"))
+            .unwrap()
+            .ino();
+        drop(first);
+        let _second = bind_unix_listener(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(temp.path().join("sock.lock"))
+                .unwrap()
+                .ino(),
+            lock_inode
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_endpoint_preserves_a_listener_without_a_sidecar_lock() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        assert_eq!(
+            bind_unix_listener(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        drop(listener);
+        let _replacement = bind_unix_listener(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_endpoint_preserves_regular_files_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let regular = temp.path().join("regular");
+        std::fs::write(&regular, "retain").unwrap();
+        assert!(bind_unix_listener(&regular).is_err());
+        assert_eq!(std::fs::read_to_string(&regular).unwrap(), "retain");
+
+        let stale = temp.path().join("stale");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let alias = temp.path().join("alias");
+        symlink(&stale, &alias).unwrap();
+        assert!(bind_unix_listener(&alias).is_err());
+        assert_eq!(std::fs::read_link(&alias).unwrap(), stale);
+
+        let path = temp.path().join("sock");
+        symlink(&regular, temp.path().join("sock.lock")).unwrap();
+        assert!(bind_unix_listener(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&regular).unwrap(), "retain");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_endpoint_rejects_a_fifo_lock_without_waiting_for_a_reader() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sock");
+        let fifo_path = temp.path().join("sock.lock");
+        let fifo = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is a valid NUL-terminated pathname for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(bind_unix_listener(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn storage_handshake_rejects_failed_required_capability() {
+        use crate::mock_command::MockCommandCreator;
+        use crate::test::mock_storage::MockStorage;
+
+        let storage = MockStorage::new(None, false).with_check_error("write permission denied");
+        let client = Client::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_wait, info) = WaitUntilZero::new();
+        let mut service = Arc::new(
+            SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::new(
+                DistClientContainer::new_disabled(),
+                Arc::new(storage),
+                &client,
+                tokio::runtime::Handle::current(),
+                tx,
+                info,
+            ),
+        );
+        let result = service
+            .call(Message::WithoutBody(Request::StorageHandshake))
+            .await;
+        match result {
+            Ok(Message::WithoutBody(Response::StorageHandshakeError(error))) => {
+                assert_eq!(error, "write permission denied");
+            }
+            _ => panic!("failed capability did not produce a handshake error response"),
+        }
+    }
 
     struct StringWriter {
         buffer: String,

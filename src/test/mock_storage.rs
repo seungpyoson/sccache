@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{Cache, CacheWrite, Storage};
+use crate::cache::{Cache, CacheMode, CacheWrite, Storage};
 use crate::config::PreprocessorCacheModeConfig;
 use crate::errors::*;
 use async_trait::async_trait;
@@ -28,6 +28,7 @@ pub struct MockStorage {
     tx: mpsc::UnboundedSender<Result<Cache>>,
     delay: Option<Duration>,
     preprocessor_cache_mode: bool,
+    check_error: Option<&'static str>,
 }
 
 impl MockStorage {
@@ -39,6 +40,7 @@ impl MockStorage {
             rx: Arc::new(Mutex::new(rx)),
             delay,
             preprocessor_cache_mode,
+            check_error: None,
         }
     }
 
@@ -46,10 +48,22 @@ impl MockStorage {
     pub(crate) fn next_get(&self, res: Result<Cache>) {
         self.tx.unbounded_send(res).unwrap();
     }
+
+    pub(crate) fn with_check_error(mut self, error: &'static str) -> Self {
+        self.check_error = Some(error);
+        self
+    }
 }
 
 #[async_trait]
 impl Storage for MockStorage {
+    async fn check(&self) -> Result<CacheMode> {
+        match self.check_error {
+            Some(error) => bail!(error),
+            None => Ok(CacheMode::ReadWrite),
+        }
+    }
+
     async fn get(&self, _key: &str) -> Result<Cache> {
         if let Some(delay) = self.delay {
             sleep(delay).await;

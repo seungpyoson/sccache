@@ -68,6 +68,8 @@ pub enum Response {
     StoragePutPreprocessorEntry(Result<(), String>),
     /// Response for `Request::RecordStats`.
     RecordStats,
+    /// A failed capability initialization cannot produce handshake metadata.
+    StorageHandshakeError(String),
 }
 
 /// Possible responses from the server for a `Compile` request.

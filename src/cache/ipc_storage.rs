@@ -45,6 +45,7 @@ impl IpcStorage {
         let resp = conn.request(Request::StorageHandshake)?;
         let handshake = match resp {
             Response::StorageHandshake(info) => info,
+            Response::StorageHandshakeError(error) => bail!(error),
             other => bail!("IpcStorage: unexpected handshake response: {other:?}"),
         };
         Ok(Self {
@@ -209,5 +210,44 @@ impl Storage for IpcStorage {
                 bail!("IpcStorage::put_preprocessor_cache_entry: unexpected response: {other:?}")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byteorder::ReadBytesExt;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn capability_handshake_returns_the_server_error_over_ipc() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let size = socket.read_u32::<byteorder::BigEndian>().unwrap();
+            let mut bytes = vec![0; size as usize];
+            socket.read_exact(&mut bytes).unwrap();
+            assert!(matches!(
+                bincode::deserialize::<Request>(&bytes).unwrap(),
+                Request::StorageHandshake
+            ));
+            crate::util::write_length_prefixed_bincode(
+                &mut socket,
+                Response::StorageHandshakeError("write permission denied".into()),
+            )
+            .unwrap();
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let result = IpcStorage::connect(ServerConnection::new(Box::new(socket)).unwrap());
+        match result {
+            Err(error) => assert_eq!(error.to_string(), "write permission denied"),
+            Ok(_) => panic!("failed capability constructed IPC storage"),
+        }
+        server.join().unwrap();
     }
 }

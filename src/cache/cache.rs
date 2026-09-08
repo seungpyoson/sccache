@@ -190,6 +190,9 @@ pub struct RemoteStorage {
     operator: opendal::Operator,
     basedirs: Vec<Vec<u8>>,
     rw_mode: CacheMode,
+    /// Successful initialization belongs to this storage instance. Mode queries
+    /// must not compete with one another by rewriting the capability probe.
+    initialized: tokio::sync::OnceCell<()>,
 }
 
 #[cfg(any(
@@ -209,6 +212,7 @@ impl RemoteStorage {
             operator,
             basedirs,
             rw_mode,
+            initialized: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -263,54 +267,41 @@ impl Storage for RemoteStorage {
     async fn check(&self) -> Result<CacheMode> {
         use opendal::ErrorKind;
 
-        let path = ".sccache_check";
+        self.initialized
+            .get_or_try_init(|| async {
+                // Use OpenDAL's bounded retry policy for temporary probe errors.
+                // The command's existing startup deadline still bounds enablement.
+                // Cache operations retain their original error behavior.
+                let operator = self
+                    .operator
+                    .clone()
+                    .layer(opendal::layers::RetryLayer::new());
+                let path = ".sccache_check";
 
-        // Read is required, return error directly if we can't read .
-        match self.operator.read(path).await {
-            Ok(_) => (),
-            // Read not exist file with not found is ok.
-            Err(err) if err.kind() == ErrorKind::NotFound => (),
-            // Tricky Part.
-            //
-            // We tolerate rate limited here to make sccache keep running.
-            // For the worse case, we will miss all the cache.
-            //
-            // In some super rare cases, user could configure storage in wrong
-            // and hitting other services rate limit. There are few things we
-            // can do, so we will print our the error here to make users know
-            // about it.
-            Err(err) if err.kind() == ErrorKind::RateLimited => {
-                eprintln!("cache storage read check: {err:?}, but we decide to keep running");
-            }
-            Err(err) => bail!("cache storage failed to read: {:?}", err),
-        }
+                match operator.read(path).await {
+                    Ok(_) => (),
+                    Err(err) if err.kind() == ErrorKind::NotFound => (),
+                    Err(err) => bail!("cache storage failed to read: {:?}", err),
+                }
 
-        // No need to check write if we are in manually-set read-only mode
-        if self.rw_mode == CacheMode::ReadOnly {
-            let mode = CacheMode::ReadOnly;
-            debug!("storage check result: {mode:?} (manually set)");
-            return Ok(mode);
-        }
+                if self.rw_mode == CacheMode::ReadWrite {
+                    match operator.write(path, "Hello, World!").await {
+                        Ok(_) => (),
+                        // Immutable backends acknowledge an existing probe.
+                        // This does not report a fresh cache write.
+                        Err(err) if err.kind() == ErrorKind::AlreadyExists => (),
+                        Err(err) => {
+                            return Err(err)
+                                .context("cache storage failed to provide requested write access");
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await?;
 
-        let can_write = match self.operator.write(path, "Hello, World!").await {
-            Ok(_) => true,
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => true,
-            // Tolerate all other write errors because we can do read at least.
-            Err(err) => {
-                eprintln!("storage write check failed: {err:?}");
-                false
-            }
-        };
-
-        let mode = if can_write {
-            CacheMode::ReadWrite
-        } else {
-            CacheMode::ReadOnly
-        };
-
-        debug!("storage check result: {mode:?}");
-
-        Ok(mode)
+        debug!("storage check result: {:?}", self.rw_mode);
+        Ok(self.rw_mode)
     }
 
     fn location(&self) -> String {
@@ -653,7 +644,181 @@ mod test {
     #[cfg(feature = "s3")]
     mod remote_storage {
         use super::*;
+        use http::{Request, Response, StatusCode};
+        use opendal::layers::HttpClientLayer;
+        use opendal::raw::{HttpBody, HttpClient, HttpFetch, Operation};
         use opendal::{Error, ErrorKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct ProbeHttp {
+            read_status: StatusCode,
+            write_status: StatusCode,
+            initial_write_statuses: Arc<std::sync::Mutex<std::collections::VecDeque<StatusCode>>>,
+            reads: Arc<AtomicUsize>,
+            writes: Arc<AtomicUsize>,
+        }
+
+        impl HttpFetch for ProbeHttp {
+            async fn fetch(
+                &self,
+                request: Request<opendal::Buffer>,
+            ) -> opendal::Result<Response<HttpBody>> {
+                tokio::task::yield_now().await;
+                let status = match request.extensions().get::<Operation>() {
+                    Some(Operation::Read) => {
+                        self.reads.fetch_add(1, Ordering::SeqCst);
+                        self.read_status
+                    }
+                    Some(Operation::Write) => {
+                        self.writes.fetch_add(1, Ordering::SeqCst);
+                        self.initial_write_statuses
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or(self.write_status)
+                    }
+                    _ => panic!("unexpected probe request: {}", request.method()),
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Length", "0")
+                    .body(HttpBody::new(futures::stream::empty(), Some(0)))
+                    .unwrap())
+            }
+        }
+
+        fn probe_storage(
+            mode: CacheMode,
+            read_status: StatusCode,
+            write_status: StatusCode,
+        ) -> (RemoteStorage, ProbeHttp) {
+            let http = ProbeHttp {
+                read_status,
+                write_status,
+                initial_write_statuses: Arc::default(),
+                reads: Arc::default(),
+                writes: Arc::default(),
+            };
+            let operator = opendal::Operator::new(
+                opendal::services::S3::default()
+                    .bucket("probe-test")
+                    .root("cache/")
+                    .region("auto")
+                    .endpoint("http://s3.invalid")
+                    .disable_config_load()
+                    .disable_ec2_metadata()
+                    .allow_anonymous(),
+            )
+            .unwrap()
+            .layer(HttpClientLayer::new(HttpClient::with(http.clone())))
+            .finish();
+            (RemoteStorage::new(operator, vec![], mode), http)
+        }
+
+        #[tokio::test]
+        async fn capability_check_rejects_failed_required_reads() {
+            for mode in [CacheMode::ReadOnly, CacheMode::ReadWrite] {
+                for status in [
+                    StatusCode::FORBIDDEN,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ] {
+                    let (storage, http) = probe_storage(mode, status, StatusCode::OK);
+                    assert!(storage.check().await.is_err(), "{mode:?}: {status}");
+                    assert_eq!(http.writes.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn capability_check_rejects_failed_required_writes() {
+            for status in [
+                StatusCode::FORBIDDEN,
+                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ] {
+                let (storage, http) =
+                    probe_storage(CacheMode::ReadWrite, StatusCode::NOT_FOUND, status);
+                assert!(storage.check().await.is_err(), "{status}");
+                assert!(storage.initialized.get().is_none());
+                if status == StatusCode::FORBIDDEN {
+                    assert_eq!(http.writes.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn capability_check_preserves_explicit_read_only_mode() {
+            for status in [StatusCode::OK, StatusCode::NOT_FOUND] {
+                let (storage, http) =
+                    probe_storage(CacheMode::ReadOnly, status, StatusCode::FORBIDDEN);
+                assert_eq!(storage.check().await.unwrap(), CacheMode::ReadOnly);
+                assert_eq!(http.writes.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn capability_check_preserves_requested_read_write_mode() {
+            for status in [StatusCode::OK, StatusCode::NOT_FOUND] {
+                let (storage, http) = probe_storage(CacheMode::ReadWrite, status, StatusCode::OK);
+                assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+                assert_eq!(http.writes.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn capability_check_initializes_once_for_concurrent_callers() {
+            let (storage, http) =
+                probe_storage(CacheMode::ReadWrite, StatusCode::NOT_FOUND, StatusCode::OK);
+            let results = futures::future::join_all((0..8).map(|_| storage.check())).await;
+            assert!(
+                results
+                    .into_iter()
+                    .all(|mode| mode.unwrap() == CacheMode::ReadWrite)
+            );
+            assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+            assert_eq!(http.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(http.writes.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn capability_check_recovers_from_temporary_initial_write_contention() {
+            let (storage, http) =
+                probe_storage(CacheMode::ReadWrite, StatusCode::NOT_FOUND, StatusCode::OK);
+            http.initial_write_statuses
+                .lock()
+                .unwrap()
+                .push_back(StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+            assert_eq!(http.writes.load(Ordering::SeqCst), 2);
+            assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+            assert_eq!(http.writes.load(Ordering::SeqCst), 2);
+        }
+
+        #[cfg(feature = "gha")]
+        #[tokio::test]
+        async fn capability_check_accepts_an_existing_immutable_probe() {
+            let http = ProbeHttp {
+                read_status: StatusCode::NOT_FOUND,
+                write_status: StatusCode::CONFLICT,
+                initial_write_statuses: Arc::default(),
+                reads: Arc::default(),
+                writes: Arc::default(),
+            };
+            let operator = opendal::Operator::new(
+                opendal::services::Ghac::default()
+                    .root("cache/")
+                    .endpoint("http://ghac.invalid/")
+                    .runtime_token("synthetic-test-token"),
+            )
+            .unwrap()
+            .layer(HttpClientLayer::new(HttpClient::with(http.clone())))
+            .finish();
+            let storage = RemoteStorage::new(operator, vec![], CacheMode::ReadWrite);
+            assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+            assert_eq!(http.writes.load(Ordering::SeqCst), 1);
+        }
 
         #[test]
         fn get_propagates_unexpected_backend_errors() {

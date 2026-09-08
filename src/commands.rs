@@ -46,9 +46,6 @@ use crate::errors::*;
 /// The default sccache server port.
 pub const DEFAULT_PORT: u16 = 4226;
 
-/// The number of milliseconds to wait for server startup.
-const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_millis(10000);
-
 /// Get the port on which the server should listen.
 fn get_addr() -> crate::net::SocketAddr {
     #[cfg(unix)]
@@ -89,7 +86,7 @@ async fn read_server_startup_status<R: AsyncReadExt + Unpin>(
 /// Re-execute the current executable as a background server, and wait
 /// for it to start up.
 #[cfg(not(windows))]
-fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup> {
+fn run_server_process(startup_timeout: Duration) -> Result<ServerStartup> {
     trace!("run_server_process");
     let tempdir = tempfile::Builder::new().prefix("sccache").tempdir()?;
     let socket_path = tempdir.path().join("sock");
@@ -122,9 +119,8 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
         read_server_startup_status(socket).await
     };
 
-    let timeout = startup_timeout.unwrap_or(SERVER_STARTUP_TIMEOUT);
     runtime.block_on(async move {
-        match tokio::time::timeout(timeout, startup).await {
+        match tokio::time::timeout(startup_timeout, startup).await {
             Ok(result) => result,
             Err(_elapsed) => Ok(ServerStartup::TimedOut),
         }
@@ -179,7 +175,7 @@ fn redirect_error_log(f: File) -> Result<()> {
 
 /// Re-execute the current executable as a background server.
 #[cfg(windows)]
-fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup> {
+fn run_server_process(startup_timeout: Duration) -> Result<ServerStartup> {
     use futures::StreamExt;
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
@@ -298,9 +294,8 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
         read_server_startup_status(socket?).await
     };
 
-    let timeout = startup_timeout.unwrap_or(SERVER_STARTUP_TIMEOUT);
     runtime.block_on(async move {
-        match tokio::time::timeout(timeout, startup).await {
+        match tokio::time::timeout(startup_timeout, startup).await {
             Ok(result) => result,
             Err(_elapsed) => Ok(ServerStartup::TimedOut),
         }
@@ -310,7 +305,7 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
 /// Attempt to connect to an sccache server listening on `addr`, or start one if no server is running.
 fn connect_or_start_server(
     addr: &crate::net::SocketAddr,
-    startup_timeout: Option<Duration>,
+    startup_timeout: Duration,
 ) -> Result<ServerConnection> {
     trace!("connect_or_start_server({addr})");
     match connect_to_server(addr) {
@@ -704,7 +699,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     // Config isn't required for all commands, but if it's broken then we should flag
     // it early and loudly.
     let config = &Config::load()?;
-    let startup_timeout = config.server_startup_timeout;
+    let startup_timeout = config.server_startup_timeout();
 
     match cmd {
         Command::ShowStats(fmt, advanced) => {
