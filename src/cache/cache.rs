@@ -244,6 +244,20 @@ fn decode_remote_cache_read(result: opendal::Result<opendal::Buffer>) -> Result<
     }
 }
 
+/// Return the stable provider-operation message allowed to cross a process
+/// boundary. The typed cause remains attached to the internal error for local
+/// diagnostics; callers must not serialize its provider context.
+pub(crate) fn classify_storage_error(operation: &str, error: &anyhow::Error) -> String {
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<opendal::Error>())
+        .map(|cause| cause.kind().to_string());
+    match kind {
+        Some(kind) => format!("cache storage {operation} failed ({kind})"),
+        None => format!("cache storage {operation} failed"),
+    }
+}
+
 /// Implement storage for operator.
 #[cfg(any(
     feature = "azure",
@@ -365,11 +379,7 @@ impl Storage for RemoteStorage {
                 trace!("opendal::Operator::get_raw({}): NotFound", key);
                 Ok(None)
             }
-            Err(e) => {
-                warn!("opendal::Operator::get_raw({}): Error: {:?}", key, e);
-                // Return error instead of silently returning None
-                Err(anyhow!("Failed to read raw bytes: {:?}", e))
-            }
+            Err(e) => Err(e).context("failed to read raw cache bytes"),
         }
     }
 
@@ -903,6 +913,18 @@ mod test {
                 error.downcast_ref::<Error>().map(Error::kind),
                 Some(ErrorKind::Unexpected)
             );
+        }
+
+        #[test]
+        fn capability_error_summary_excludes_provider_context() {
+            let provider = Error::new(ErrorKind::PermissionDenied, "synthetic-provider-detail");
+            let error = anyhow::Error::new(provider).context("failed to read raw cache bytes");
+            let summary = super::super::classify_storage_error("read raw entry", &error);
+            assert_eq!(
+                summary,
+                "cache storage read raw entry failed (PermissionDenied)"
+            );
+            assert!(!summary.contains("synthetic-provider-detail"));
         }
     }
 

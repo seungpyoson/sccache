@@ -13,7 +13,7 @@
 // limitations under the License.SCCACHE_MAX_FRAME_LENGTH
 
 use crate::cache::readonly::ReadOnlyStorage;
-use crate::cache::{CacheMode, Storage, storage_from_config};
+use crate::cache::{CacheMode, Storage, classify_storage_error, storage_from_config};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
     CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
@@ -506,7 +506,8 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
             Ok(())
         }
         Err(e) => {
-            error!("failed to start server: {e}");
+            let startup_reason = classify_storage_error("startup", &e);
+            error!("failed to start server: {startup_reason}");
             let io_error = e.downcast_ref::<io::Error>();
             if io_error.is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse) {
                 notify_server_startup(notify.as_ref(), ServerStartup::AddrInUse)?;
@@ -514,11 +515,15 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 // 10013 is the "WSAEACCES" error, which can occur if the requested port
                 // has been allocated for other purposes, such as winNAT or Hyper-V.
                 let windows_help_message = "A Windows port exclusion is blocking use of the configured port.\nTry setting SCCACHE_SERVER_PORT to a new value.";
-                let reason: String = format!("{windows_help_message}\n{e}");
+                let reason = format!("{windows_help_message}\n{startup_reason}");
                 notify_server_startup(notify.as_ref(), ServerStartup::Err { reason })?;
             } else {
-                let reason = e.to_string();
-                notify_server_startup(notify.as_ref(), ServerStartup::Err { reason })?;
+                notify_server_startup(
+                    notify.as_ref(),
+                    ServerStartup::Err {
+                        reason: startup_reason,
+                    },
+                )?;
             }
             Err(e)
         }
@@ -954,7 +959,7 @@ where
                         })
                     }
                     .await
-                    .map_err(|error: anyhow::Error| format!("{error:#}"));
+                    .map_err(|error: anyhow::Error| classify_storage_error("handshake", &error));
                     let response = match info {
                         Ok(info) => Response::StorageHandshake(info),
                         Err(error) => Response::StorageHandshakeError(error),
@@ -972,8 +977,9 @@ where
                     let resp = match me.storage.get_raw(&key).await {
                         Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
                         Err(e) => {
-                            warn!("storage_get_raw error: {e:#}");
-                            Response::StorageGetRawError(format!("{e:#}"))
+                            let reason = classify_storage_error("read raw entry", &e);
+                            warn!("storage_get_raw error: {reason}");
+                            Response::StorageGetRawError(reason)
                         }
                     };
                     Ok(Message::WithoutBody(resp))
@@ -985,7 +991,7 @@ where
                         .put_raw(&key, data.into())
                         .await
                         .map(|_| ())
-                        .map_err(|e| format!("{e:#}"));
+                        .map_err(|e| classify_storage_error("write raw entry", &e));
                     Ok(Message::WithoutBody(Response::StoragePutRaw(result)))
                 }
                 Request::StorageGetPreprocessorEntry { key } => {
@@ -1002,7 +1008,7 @@ where
                                 Some(buf)
                             })
                         })
-                        .map_err(|e| format!("{e:#}"));
+                        .map_err(|e| classify_storage_error("read preprocessor entry", &e));
                     Ok(Message::WithoutBody(Response::StorageGetPreprocessorEntry(
                         result,
                     )))
@@ -1015,7 +1021,7 @@ where
                         me.storage
                             .put_preprocessor_cache_entry(&key, entry)
                             .await
-                            .map_err(|e| format!("{e:#}"))
+                            .map_err(|e| classify_storage_error("write preprocessor entry", &e))
                     }
                     .await;
                     Ok(Message::WithoutBody(Response::StoragePutPreprocessorEntry(
@@ -2631,7 +2637,8 @@ mod tests {
             .await;
         match result {
             Ok(Message::WithoutBody(Response::StorageHandshakeError(error))) => {
-                assert_eq!(error, "write permission denied");
+                assert_eq!(error, "cache storage handshake failed");
+                assert!(!error.contains("write permission denied"));
             }
             _ => panic!("failed capability did not produce a handshake error response"),
         }
@@ -2675,12 +2682,91 @@ mod tests {
         result
     }
 
+    async fn preprocessor_operation_over_ipc(
+        storage: impl Storage + 'static,
+        write: bool,
+    ) -> Result<()> {
+        use crate::cache::IpcStorage;
+        use crate::client::ServerConnection;
+        use crate::mock_command::MockCommandCreator;
+        let jobserver = Client::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_wait, info) = WaitUntilZero::new();
+        let service = SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::new(
+            DistClientContainer::new_disabled(),
+            Arc::new(storage),
+            &jobserver,
+            tokio::runtime::Handle::current(),
+            tx,
+            info,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            service.bind(socket).await.unwrap();
+        });
+        let result = tokio::task::spawn_blocking(move || {
+            let stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let storage =
+                IpcStorage::connect(ServerConnection::new(Box::new(stream)).unwrap()).unwrap();
+            crate::util::new_client_runtime()
+                .unwrap()
+                .block_on(async move {
+                    if write {
+                        storage
+                            .put_preprocessor_cache_entry(
+                                "entry",
+                                PreprocessorCacheEntry::default(),
+                            )
+                            .await
+                    } else {
+                        storage
+                            .get_preprocessor_cache_entry("entry")
+                            .await
+                            .map(|_| ())
+                    }
+                })
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        result
+    }
+
     #[tokio::test]
     async fn capability_remote_read_error_survives_the_real_ipc_transport() {
         let storage = crate::test::mock_storage::MockStorage::new(None, false)
             .with_raw_read_error("remote read permission denied");
         let error = read_entry_over_ipc(storage).await.unwrap_err();
-        assert_eq!(error.to_string(), "remote read permission denied");
+        assert_eq!(error.to_string(), "cache storage read raw entry failed");
+        assert!(!error.to_string().contains("remote read permission denied"));
+    }
+
+    #[tokio::test]
+    async fn capability_preprocessor_provider_errors_are_classified_over_ipc() {
+        for write in [false, true] {
+            let storage = if write {
+                crate::test::mock_storage::MockStorage::new(None, true)
+                    .with_preprocessor_write_error("synthetic provider detail")
+            } else {
+                crate::test::mock_storage::MockStorage::new(None, true)
+                    .with_preprocessor_read_error("synthetic provider detail")
+            };
+            let error = preprocessor_operation_over_ipc(storage, write)
+                .await
+                .unwrap_err();
+            let expected = if write {
+                "cache storage write preprocessor entry failed"
+            } else {
+                "cache storage read preprocessor entry failed"
+            };
+            assert!(error.to_string().contains(expected));
+            assert!(!error.to_string().contains("synthetic provider detail"));
+        }
     }
 
     #[tokio::test]
