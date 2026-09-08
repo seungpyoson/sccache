@@ -286,7 +286,11 @@ impl Storage for RemoteStorage {
                 match operator.read(path).await {
                     Ok(_) => (),
                     Err(err) if err.kind() == ErrorKind::NotFound => (),
-                    Err(err) => bail!("cache storage failed to read: {:?}", err),
+                    Err(err) => {
+                        let kind = err.kind();
+                        return Err(err)
+                            .with_context(|| format!("cache storage failed to read ({kind})"));
+                    }
                 }
 
                 if self.rw_mode == CacheMode::ReadWrite {
@@ -738,7 +742,14 @@ mod test {
                     StatusCode::SERVICE_UNAVAILABLE,
                 ] {
                     let (storage, http) = probe_storage(mode, status, StatusCode::OK);
-                    assert!(storage.check().await.is_err(), "{mode:?}: {status}");
+                    let error = storage.check().await.unwrap_err();
+                    assert!(error.is::<Error>(), "{mode:?}: {status}");
+                    if status == StatusCode::FORBIDDEN {
+                        assert_eq!(
+                            error.to_string(),
+                            "cache storage failed to read (PermissionDenied)"
+                        );
+                    }
                     assert_eq!(http.writes.load(Ordering::SeqCst), 0);
                 }
             }
@@ -753,9 +764,14 @@ mod test {
             ] {
                 let (storage, http) =
                     probe_storage(CacheMode::ReadWrite, StatusCode::NOT_FOUND, status);
-                assert!(storage.check().await.is_err(), "{status}");
+                let error = storage.check().await.unwrap_err();
+                assert!(error.is::<Error>(), "{status}");
                 assert!(storage.initialized.get().is_none());
                 if status == StatusCode::FORBIDDEN {
+                    assert_eq!(
+                        error.to_string(),
+                        "cache storage failed to provide requested write access (PermissionDenied)"
+                    );
                     assert_eq!(http.writes.load(Ordering::SeqCst), 1);
                 }
             }
