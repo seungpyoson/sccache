@@ -506,7 +506,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
             Ok(())
         }
         Err(e) => {
-            let startup_reason = classify_storage_error("startup", &e);
+            let startup_reason = e.to_string();
             error!("failed to start server: {startup_reason}");
             let io_error = e.downcast_ref::<io::Error>();
             if io_error.is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse) {
@@ -968,9 +968,14 @@ where
                 }
                 Request::StorageGetPath { key } => {
                     debug!("handle_client: storage_get_path key={}", key);
-                    Ok(Message::WithoutBody(Response::StorageGetPath(
-                        me.storage.get_path(&key).await,
-                    )))
+                    let response = match me.storage.get_path(&key).await {
+                        Ok(result) => Response::StorageGetPath(result),
+                        Err(error) => Response::StorageGetPathError(classify_storage_error(
+                            "read entry path",
+                            &error,
+                        )),
+                    };
+                    Ok(Message::WithoutBody(response))
                 }
                 Request::StorageGetRaw { key } => {
                     debug!("handle_client: storage_get_raw key={}", key);
@@ -1000,13 +1005,14 @@ where
                         .storage
                         .get_preprocessor_cache_entry(&key)
                         .await
-                        .map(|opt| {
-                            opt.and_then(|mut seekable| {
+                        .and_then(|opt| {
+                            opt.map(|mut seekable| {
                                 use std::io::Read;
                                 let mut buf = vec![];
-                                seekable.read_to_end(&mut buf).ok()?;
-                                Some(buf)
+                                seekable.read_to_end(&mut buf)?;
+                                Ok(buf)
                             })
+                            .transpose()
                         })
                         .map_err(|e| classify_storage_error("read preprocessor entry", &e));
                     Ok(Message::WithoutBody(Response::StorageGetPreprocessorEntry(
@@ -1203,13 +1209,15 @@ where
 
     /// Get info and stats about the cache.
     async fn get_info(&self) -> Result<ServerInfo> {
-        let stats = self.stats.lock().await.clone();
-        ServerInfo::new(stats, Some(&*self.storage)).await
+        let stats = self.stats.lock().await;
+        ServerInfo::new(stats.clone(), Some(&*self.storage)).await
     }
 
     /// Zero stats about the cache.
     async fn zero_stats(&self) {
-        *self.stats.lock().await = ServerStats::default();
+        let mut stats = self.stats.lock().await;
+        self.storage.reset_stats();
+        *stats = ServerStats::default();
     }
 
     /// Snapshot and reset the current stats (used by client-side processes before exit).
@@ -2219,6 +2227,8 @@ impl ServerInfo {
         let version = env!("CARGO_PKG_VERSION").to_string();
         Ok(ServerInfo {
             stats: ServerStats {
+                cache_read_errors: stats.cache_read_errors
+                    + storage.map_or(0, Storage::read_error_count),
                 multi_level,
                 ..stats
             },
@@ -2644,7 +2654,12 @@ mod tests {
         }
     }
 
-    async fn read_entry_over_ipc(storage: impl Storage + 'static) -> Result<crate::cache::Cache> {
+    async fn with_ipc_storage<T, F, Fut>(storage: impl Storage + 'static, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(crate::cache::IpcStorage) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         use crate::cache::IpcStorage;
         use crate::client::ServerConnection;
         use crate::mock_command::MockCommandCreator;
@@ -2674,62 +2689,7 @@ mod tests {
                 IpcStorage::connect(ServerConnection::new(Box::new(stream)).unwrap()).unwrap();
             crate::util::new_client_runtime()
                 .unwrap()
-                .block_on(storage.get("entry"))
-        })
-        .await
-        .unwrap();
-        server.await.unwrap();
-        result
-    }
-
-    async fn preprocessor_operation_over_ipc(
-        storage: impl Storage + 'static,
-        write: bool,
-    ) -> Result<()> {
-        use crate::cache::IpcStorage;
-        use crate::client::ServerConnection;
-        use crate::mock_command::MockCommandCreator;
-        let jobserver = Client::new();
-        let (tx, _rx) = mpsc::channel(1);
-        let (_wait, info) = WaitUntilZero::new();
-        let service = SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::new(
-            DistClientContainer::new_disabled(),
-            Arc::new(storage),
-            &jobserver,
-            tokio::runtime::Handle::current(),
-            tx,
-            info,
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            service.bind(socket).await.unwrap();
-        });
-        let result = tokio::task::spawn_blocking(move || {
-            let stream = std::net::TcpStream::connect(address).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let storage =
-                IpcStorage::connect(ServerConnection::new(Box::new(stream)).unwrap()).unwrap();
-            crate::util::new_client_runtime()
-                .unwrap()
-                .block_on(async move {
-                    if write {
-                        storage
-                            .put_preprocessor_cache_entry(
-                                "entry",
-                                PreprocessorCacheEntry::default(),
-                            )
-                            .await
-                    } else {
-                        storage
-                            .get_preprocessor_cache_entry("entry")
-                            .await
-                            .map(|_| ())
-                    }
-                })
+                .block_on(operation(storage))
         })
         .await
         .unwrap();
@@ -2741,7 +2701,9 @@ mod tests {
     async fn capability_remote_read_error_survives_the_real_ipc_transport() {
         let storage = crate::test::mock_storage::MockStorage::new(None, false)
             .with_raw_read_error("remote read permission denied");
-        let error = read_entry_over_ipc(storage).await.unwrap_err();
+        let error = with_ipc_storage(storage, |storage| async move { storage.get("entry").await })
+            .await
+            .unwrap_err();
         assert_eq!(error.to_string(), "cache storage read raw entry failed");
         assert!(!error.to_string().contains("remote read permission denied"));
     }
@@ -2756,9 +2718,20 @@ mod tests {
                 crate::test::mock_storage::MockStorage::new(None, true)
                     .with_preprocessor_read_error("synthetic provider detail")
             };
-            let error = preprocessor_operation_over_ipc(storage, write)
-                .await
-                .unwrap_err();
+            let error = with_ipc_storage(storage, move |storage| async move {
+                if write {
+                    storage
+                        .put_preprocessor_cache_entry("entry", PreprocessorCacheEntry::default())
+                        .await
+                } else {
+                    storage
+                        .get_preprocessor_cache_entry("entry")
+                        .await
+                        .map(|_| ())
+                }
+            })
+            .await
+            .unwrap_err();
             let expected = if write {
                 "cache storage write preprocessor entry failed"
             } else {
@@ -2773,8 +2746,107 @@ mod tests {
     async fn capability_ipc_rejects_corrupt_raw_entry() {
         let storage = crate::test::mock_storage::MockStorage::new(None, false)
             .with_raw_read_bytes(bytes::Bytes::from_static(b"invalid cache archive"));
-        let error = read_entry_over_ipc(storage).await.unwrap_err();
+        let error = with_ipc_storage(storage, |storage| async move { storage.get("entry").await })
+            .await
+            .unwrap_err();
         assert!(error.is::<zip::result::ZipError>(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn capability_preprocessor_stream_failure_is_not_absence_over_ipc() {
+        struct FailedReader;
+        impl std::io::Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("synthetic stream failure"))
+            }
+        }
+        impl std::io::Seek for FailedReader {
+            fn seek(&mut self, _: io::SeekFrom) -> io::Result<u64> {
+                Ok(0)
+            }
+        }
+        let failed = crate::test::mock_storage::MockStorage::new(None, true)
+            .with_preprocessor_reader(|| Box::new(FailedReader));
+        let result = with_ipc_storage(failed, |storage| async move {
+            storage
+                .get_preprocessor_cache_entry("entry")
+                .await
+                .map(|_| ())
+        })
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cache storage read preprocessor entry failed")
+        );
+        for present in [false, true] {
+            let mut storage = crate::test::mock_storage::MockStorage::new(None, true);
+            if present {
+                storage = storage
+                    .with_preprocessor_reader(|| Box::new(io::Cursor::new(b"healthy bytes")));
+            }
+            let bytes = with_ipc_storage(storage, |storage| async move {
+                storage
+                    .get_preprocessor_cache_entry("entry")
+                    .await?
+                    .map(|mut reader| {
+                        let mut bytes = Vec::new();
+                        reader.read_to_end(&mut bytes)?;
+                        Ok(bytes)
+                    })
+                    .transpose()
+            })
+            .await
+            .unwrap();
+            assert_eq!(bytes.as_deref(), present.then_some(&b"healthy bytes"[..]));
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_disk_path_errors_remain_errors_over_ipc() {
+        let directory = tempfile::tempdir().unwrap();
+        for broken in [false, true] {
+            let root = directory
+                .path()
+                .join(if broken { "file" } else { "directory" });
+            if broken {
+                std::fs::write(&root, "retain").unwrap();
+            }
+            let storage = crate::cache::disk::DiskCache::new(
+                &root,
+                u64::MAX,
+                &tokio::runtime::Handle::current(),
+                crate::config::PreprocessorCacheModeConfig::default(),
+                CacheMode::ReadWrite,
+                vec![],
+            );
+            let result = with_ipc_storage(storage, |storage| async move {
+                assert!(matches!(
+                    storage.get_path("missing").await?,
+                    crate::cache::GetPathResult::Miss
+                ));
+                storage
+                    .put("entry", crate::cache::CacheWrite::default())
+                    .await?;
+                assert!(matches!(
+                    storage.get_path("entry").await?,
+                    crate::cache::GetPathResult::Found(_)
+                ));
+                Ok(())
+            })
+            .await;
+            if broken {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("cache storage read entry path failed")
+                );
+            } else {
+                result.unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -2792,7 +2864,9 @@ mod tests {
             .put_raw("entry", bytes::Bytes::from_static(b"invalid cache archive"))
             .await
             .unwrap();
-        let error = read_entry_over_ipc(storage).await.unwrap_err();
+        let error = with_ipc_storage(storage, |storage| async move { storage.get("entry").await })
+            .await
+            .unwrap_err();
         assert!(error.is::<zip::result::ZipError>(), "{error:#}");
     }
 
@@ -2840,6 +2914,105 @@ mod tests {
             }
             assert_eq!(service.take_stats().await.compile_requests, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn capability_storage_snapshots_are_not_merged_into_client_deltas() {
+        use crate::mock_command::MockCommandCreator;
+        use crate::test::mock_storage::MockStorage;
+        let failed = MockStorage::new(None, false).with_raw_read_error("read failed");
+        let healthy = MockStorage::new(None, false)
+            .with_raw_read_bytes(crate::cache::CacheWrite::default().finish().unwrap().into());
+        let storage = Arc::new(crate::cache::multilevel::MultiLevelStorage::new(vec![
+            Arc::new(failed),
+            Arc::new(healthy),
+        ]));
+        let client = Client::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_wait, info) = WaitUntilZero::new();
+        let service = SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::new(
+            DistClientContainer::new_disabled(),
+            storage.clone(),
+            &client,
+            tokio::runtime::Handle::current(),
+            tx,
+            info,
+        );
+        storage.get_raw("entry").await.unwrap();
+        assert_eq!(service.get_info().await.unwrap().stats.cache_read_errors, 1);
+        let delta = service.take_stats().await;
+        assert_eq!(delta.cache_read_errors, 0);
+        service.merge_stats(delta).await;
+        assert_eq!(service.get_info().await.unwrap().stats.cache_read_errors, 1);
+        service.zero_stats().await;
+        let reset = service.get_info().await.unwrap();
+        assert_eq!(reset.stats.cache_read_errors, 0);
+        assert_eq!(reset.stats.multi_level.unwrap().0[1].hits, 0);
+        storage.get_raw("entry").await.unwrap();
+        assert_eq!(service.get_info().await.unwrap().stats.cache_read_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn capability_zero_stats_resets_completed_storage_writes() {
+        use crate::mock_command::MockCommandCreator;
+        let directory = tempfile::tempdir().unwrap();
+        let disk = crate::cache::disk::DiskCache::new(
+            directory.path(),
+            u64::MAX,
+            &tokio::runtime::Handle::current(),
+            crate::config::PreprocessorCacheModeConfig::default(),
+            CacheMode::ReadWrite,
+            vec![],
+        );
+        let storage = Arc::new(
+            crate::cache::multilevel::MultiLevelStorage::with_write_error_policy(
+                vec![
+                    Arc::new(disk),
+                    Arc::new(crate::test::mock_storage::MockStorage::new(None, false)),
+                ],
+                crate::config::WriteErrorPolicy::All,
+            ),
+        );
+        let client = Client::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_wait, info) = WaitUntilZero::new();
+        let mut service = Arc::new(
+            SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::new(
+                DistClientContainer::new_disabled(),
+                storage.clone(),
+                &client,
+                tokio::runtime::Handle::current(),
+                tx,
+                info,
+            ),
+        );
+        for _ in 0..2 {
+            assert!(
+                storage
+                    .put("entry", crate::cache::CacheWrite::default())
+                    .await
+                    .is_err()
+            );
+        }
+        let before = service.get_info().await.unwrap().stats.multi_level.unwrap();
+        assert_eq!((before.0[0].writes, before.0[1].write_failures), (2, 2));
+        assert!(matches!(
+            service
+                .call(Message::WithoutBody(Request::ZeroStats))
+                .await
+                .unwrap(),
+            Message::WithoutBody(Response::ZeroStats)
+        ));
+        let reset = service.get_info().await.unwrap().stats.multi_level.unwrap();
+        assert_eq!((reset.0[0].writes, reset.0[1].write_failures), (0, 0));
+        assert!(
+            storage
+                .put("entry", crate::cache::CacheWrite::default())
+                .await
+                .is_err()
+        );
+        let after = service.get_info().await.unwrap().stats.multi_level.unwrap();
+        assert_eq!((after.0[0].writes, after.0[1].write_failures), (1, 1));
     }
 
     struct StringWriter {

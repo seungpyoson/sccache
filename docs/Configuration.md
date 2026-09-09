@@ -179,7 +179,7 @@ Note that some env variables may need sccache server restart to take effect.
   - If you want to be apply to all cache, you should reset cache and make new cache.
 * `SCCACHE_LOG_MILLIS` when set (to any value), enables millisecond precision timestamps in log output instead of the default second precision.
 * `SCCACHE_ERROR_LOG` path to a file where sccache will log errors
-* `SCCACHE_LOG` log level, accepting standard env_logger values, see [env_logger documentation](https://docs.rs/env_logger/latest/env_logger/#enabling-logging) for details
+* `SCCACHE_LOG` log level for sccache's own diagnostics, accepting standard env_logger values, see [env_logger documentation](https://docs.rs/env_logger/latest/env_logger/#enabling-logging) for details. Dependency log targets are excluded because provider libraries can include credentials or response bodies. Remote storage failures report the operation and error kind without provider diagnostics.
 
 ### cache configs
 

@@ -138,6 +138,15 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// Failed backend read operations, including reads recovered by another level.
+    /// This is storage accounting, not a count of recompiled requests.
+    fn read_error_count(&self) -> u64 {
+        0
+    }
+
+    /// Reset completed storage-operation statistics alongside server statistics.
+    fn reset_stats(&self) {}
+
     /// Return the config for preprocessor cache mode if applicable
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
         // Enable by default, only in local mode
@@ -149,8 +158,8 @@ pub trait Storage: Send + Sync {
     }
     /// Return the filesystem path of the cached entry for `key`.
     /// Default impl returns [`GetPathResult::Unsupported`].
-    async fn get_path(&self, _key: &str) -> GetPathResult {
-        GetPathResult::Unsupported
+    async fn get_path(&self, _key: &str) -> Result<GetPathResult> {
+        Ok(GetPathResult::Unsupported)
     }
 
     /// Return the preprocessor cache entry for a given preprocessor key,
@@ -173,6 +182,22 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 }
+
+/// The only provider error data retained by storage consumers. Provider bodies,
+/// URLs and nested causes are discarded at the remote adapter boundary.
+#[derive(Debug)]
+struct RemoteStorageError {
+    operation: &'static str,
+    kind: String,
+}
+
+impl std::fmt::Display for RemoteStorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.operation, self.kind)
+    }
+}
+
+impl std::error::Error for RemoteStorageError {}
 
 /// Wrapper for opendal::Operator that adds basedirs support
 #[cfg(any(
@@ -211,6 +236,14 @@ pub struct RemoteStorage {
     feature = "cos"
 ))]
 impl RemoteStorage {
+    pub(crate) fn error(operation: &'static str, error: opendal::Error) -> anyhow::Error {
+        RemoteStorageError {
+            operation,
+            kind: error.kind().to_string(),
+        }
+        .into()
+    }
+
     pub fn new(operator: opendal::Operator, basedirs: Vec<Vec<u8>>, rw_mode: CacheMode) -> Self {
         Self {
             operator,
@@ -240,18 +273,17 @@ fn decode_remote_cache_read(result: opendal::Result<opendal::Buffer>) -> Result<
             Ok(Cache::Hit(hit))
         }
         Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(Cache::Miss),
-        Err(e) => Err(e).context("failed to read remote cache entry"),
+        Err(e) => Err(RemoteStorage::error("failed to read remote cache entry", e)),
     }
 }
 
 /// Return the stable provider-operation message allowed to cross a process
-/// boundary. The typed cause remains attached to the internal error for local
-/// diagnostics; callers must not serialize its provider context.
+/// boundary. The remote adapter has already discarded provider context.
 pub(crate) fn classify_storage_error(operation: &str, error: &anyhow::Error) -> String {
     let kind = error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<opendal::Error>())
-        .map(|cause| cause.kind().to_string());
+        .find_map(|cause| cause.downcast_ref::<RemoteStorageError>())
+        .map(|cause| &cause.kind);
     match kind {
         Some(kind) => format!("cache storage {operation} failed ({kind})"),
         None => format!("cache storage {operation} failed"),
@@ -291,19 +323,24 @@ impl Storage for RemoteStorage {
                 // Use OpenDAL's bounded retry policy for temporary probe errors.
                 // The command's existing startup deadline still bounds enablement.
                 // Cache operations retain their original error behavior.
-                let operator = self
-                    .operator
-                    .clone()
-                    .layer(opendal::layers::RetryLayer::new());
+                let operator =
+                    self.operator
+                        .clone()
+                        .layer(opendal::layers::RetryLayer::new().with_notify(
+                            |error: &opendal::Error, delay: Duration| {
+                                warn!(
+                                    "retrying cache capability check ({}) after {delay:?}",
+                                    error.kind()
+                                );
+                            },
+                        ));
                 let path = ".sccache_check";
 
                 match operator.read(path).await {
                     Ok(_) => (),
                     Err(err) if err.kind() == ErrorKind::NotFound => (),
                     Err(err) => {
-                        let kind = err.kind();
-                        return Err(err)
-                            .with_context(|| format!("cache storage failed to read ({kind})"));
+                        return Err(Self::error("cache storage failed to read", err));
                     }
                 }
 
@@ -314,9 +351,9 @@ impl Storage for RemoteStorage {
                         // This does not report a fresh cache write.
                         Err(err) if err.kind() == ErrorKind::AlreadyExists => (),
                         Err(err) => {
-                            let kind = err.kind();
-                            return Err(err).with_context(|| format!(
-                                "cache storage failed to provide requested write access ({kind})"
+                            return Err(Self::error(
+                                "cache storage failed to provide requested write access",
+                                err,
                             ));
                         }
                     }
@@ -379,7 +416,7 @@ impl Storage for RemoteStorage {
                 trace!("opendal::Operator::get_raw({}): NotFound", key);
                 Ok(None)
             }
-            Err(e) => Err(e).context("failed to read raw cache bytes"),
+            Err(e) => Err(Self::error("failed to read raw cache bytes", e)),
         }
     }
 
@@ -396,7 +433,10 @@ impl Storage for RemoteStorage {
             bail!("storage is read-only");
         }
 
-        self.operator.write(&normalize_key(key), data).await?;
+        self.operator
+            .write(&normalize_key(key), data)
+            .await
+            .map_err(|e| Self::error("failed to write remote cache entry", e))?;
 
         Ok(start.elapsed())
     }
@@ -477,7 +517,7 @@ pub fn build_single_cache(
             key_prefix,
             rw_mode,
         }) => {
-            debug!("Init memcached cache with url {url}");
+            debug!("Init memcached cache");
 
             let operator = MemcachedCache::build(
                 url,
@@ -504,7 +544,7 @@ pub fn build_single_cache(
         }) => {
             let storage = match (endpoint, cluster_endpoints, url) {
                 (Some(url), None, None) => {
-                    debug!("Init redis single-node cache with url {url}");
+                    debug!("Init redis single-node cache");
                     RedisCache::build_single(
                         url,
                         username.as_deref(),
@@ -515,7 +555,7 @@ pub fn build_single_cache(
                     )
                 }
                 (None, Some(urls), None) => {
-                    debug!("Init redis cluster cache with urls {urls}");
+                    debug!("Init redis cluster cache");
                     RedisCache::build_cluster(
                         urls,
                         username.as_deref(),
@@ -526,7 +566,7 @@ pub fn build_single_cache(
                     )
                 }
                 (None, None, Some(url)) => {
-                    warn!("Init redis single-node cache from deprecated API with url {url}");
+                    warn!("Init redis single-node cache from deprecated URL API");
                     if username.is_some() || password.is_some() || *db != crate::config::DEFAULT_REDIS_DB {
                         bail!("`username`, `password` and `db` has no effect when `url` is set. Please use `endpoint` or `cluster_endpoints` for new API accessing");
                     }
@@ -541,10 +581,7 @@ pub fn build_single_cache(
         }
         #[cfg(feature = "s3")]
         CacheType::S3(c) => {
-            debug!(
-                "Init s3 cache with bucket {}, endpoint {:?}",
-                c.bucket, c.endpoint
-            );
+            debug!("Init s3 cache");
             let storage_builder =
                 S3Cache::new(c.bucket.clone(), c.key_prefix.clone(), c.no_credentials);
             let operator = storage_builder
@@ -561,7 +598,7 @@ pub fn build_single_cache(
         }
         #[cfg(feature = "webdav")]
         CacheType::Webdav(c) => {
-            debug!("Init webdav cache with endpoint {}", c.endpoint);
+            debug!("Init webdav cache");
 
             let operator = WebdavCache::build(
                 &c.endpoint,
@@ -577,10 +614,7 @@ pub fn build_single_cache(
         }
         #[cfg(feature = "oss")]
         CacheType::OSS(c) => {
-            debug!(
-                "Init oss cache with bucket {}, endpoint {:?}",
-                c.bucket, c.endpoint
-            );
+            debug!("Init oss cache");
 
             let operator = OSSCache::build(
                 &c.bucket,
@@ -595,10 +629,7 @@ pub fn build_single_cache(
         }
         #[cfg(feature = "cos")]
         CacheType::COS(c) => {
-            debug!(
-                "Init cos cache with bucket {}, endpoint {:?}",
-                c.bucket, c.endpoint
-            );
+            debug!("Init cos cache");
 
             let operator = COSCache::build(&c.bucket, &c.key_prefix, c.endpoint.as_deref())
                 .map_err(|err| anyhow!("create cos cache failed: {err:?}"))?;
@@ -753,7 +784,7 @@ mod test {
                 ] {
                     let (storage, http) = probe_storage(mode, status, StatusCode::OK);
                     let error = storage.check().await.unwrap_err();
-                    assert!(error.is::<Error>(), "{mode:?}: {status}");
+                    assert!(error.is::<RemoteStorageError>(), "{mode:?}: {status}");
                     if status == StatusCode::FORBIDDEN {
                         assert_eq!(
                             error.to_string(),
@@ -775,7 +806,7 @@ mod test {
                 let (storage, http) =
                     probe_storage(CacheMode::ReadWrite, StatusCode::NOT_FOUND, status);
                 let error = storage.check().await.unwrap_err();
-                assert!(error.is::<Error>(), "{status}");
+                assert!(error.is::<RemoteStorageError>(), "{status}");
                 assert!(storage.initialized.get().is_none());
                 if status == StatusCode::FORBIDDEN {
                     assert_eq!(
@@ -910,21 +941,25 @@ mod test {
             .unwrap_err();
 
             assert_eq!(
-                error.downcast_ref::<Error>().map(Error::kind),
-                Some(ErrorKind::Unexpected)
+                error
+                    .downcast_ref::<RemoteStorageError>()
+                    .map(|e| e.kind.as_str()),
+                Some("Unexpected")
             );
         }
 
         #[test]
         fn capability_error_summary_excludes_provider_context() {
             let provider = Error::new(ErrorKind::PermissionDenied, "synthetic-provider-detail");
-            let error = anyhow::Error::new(provider).context("failed to read raw cache bytes");
+            let error = RemoteStorage::error("failed to read raw cache bytes", provider);
             let summary = super::super::classify_storage_error("read raw entry", &error);
             assert_eq!(
                 summary,
                 "cache storage read raw entry failed (PermissionDenied)"
             );
             assert!(!summary.contains("synthetic-provider-detail"));
+            assert_eq!(error.chain().count(), 1);
+            assert!(!format!("{error:?}").contains("synthetic-provider-detail"));
         }
     }
 

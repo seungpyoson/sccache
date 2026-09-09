@@ -114,19 +114,21 @@ impl CacheRead {
     }
 
     /// Get the stdout from this cache entry, if it exists.
-    pub fn get_stdout(&mut self) -> Vec<u8> {
+    pub fn get_stdout(&mut self) -> Result<Vec<u8>> {
         self.get_bytes("stdout")
     }
 
     /// Get the stderr from this cache entry, if it exists.
-    pub fn get_stderr(&mut self) -> Vec<u8> {
+    pub fn get_stderr(&mut self) -> Result<Vec<u8>> {
         self.get_bytes("stderr")
     }
 
-    fn get_bytes(&mut self, name: &str) -> Vec<u8> {
+    fn get_bytes(&mut self, name: &str) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        drop(self.get_object(name, &mut bytes));
-        bytes
+        if self.zip.file_names().any(|member| member == name) {
+            self.get_object(name, &mut bytes)?;
+        }
+        Ok(bytes)
     }
 
     pub async fn extract_objects<T>(
@@ -144,6 +146,9 @@ impl CacheRead {
                 optional,
             } in objects
             {
+                if optional && !self.zip.file_names().any(|member| member == key) {
+                    continue;
+                }
                 if is_path_null(&path) {
                     // For unix, this is just a fast path to discard such outputs,
                     // so it is not an issue if `is_path_null` has false-negatives.
@@ -163,25 +168,18 @@ impl CacheRead {
                 // Write the cache entry to a tempfile and then atomically
                 // move it to its final location so that other rustc invocations
                 // happening in parallel don't see a partially-written file.
-                match (NamedTempFile::new_in(dir), optional) {
-                    (Ok(mut tmp), _) => {
-                        match (self.get_object(&key, &mut tmp), optional) {
-                            (Ok(mode), _) => {
-                                tmp.persist(&path)?;
-                                if let Some(mode) = mode {
-                                    set_file_mode(path.as_path(), mode)?;
-                                }
-                            }
-                            (Err(e), false) => return Err(e),
-                            // skip if no object found and it's optional
-                            (Err(_), true) => continue,
+                match NamedTempFile::new_in(dir) {
+                    Ok(mut tmp) => {
+                        let mode = self.get_object(&key, &mut tmp)?;
+                        tmp.persist(&path)?;
+                        if let Some(mode) = mode {
+                            set_file_mode(path.as_path(), mode)?;
                         }
                     }
-                    (Err(e), false) => {
+                    Err(e) => {
                         // Fall back to writing directly to the final location
                         warn!("Failed to create temp file on the same file system: {e}");
                         let mut f = std::fs::File::create(&path)?;
-                        // `optional` is false in this branch, so do not ignore errors
                         let mode = self.get_object(&key, &mut f)?;
                         if let Some(mode) = mode {
                             if let Err(e) = set_file_mode(path.as_path(), mode) {
@@ -192,8 +190,6 @@ impl CacheRead {
                             }
                         }
                     }
-                    // skip if no object found and it's optional
-                    (Err(_), true) => continue,
                 }
             }
             Ok(())
@@ -254,8 +250,13 @@ impl CacheWrite {
                             format!("failed to put object `{:?}` in cache entry", path)
                         })?;
                     }
-                    (Err(e), false) => return Err(e),
-                    (Err(_), true) => continue,
+                    (Err(e), true)
+                        if e.downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        continue;
+                    }
+                    (Err(e), _) => return Err(e),
                 }
             }
             Ok(entry)
@@ -323,6 +324,94 @@ impl Default for CacheWrite {
 mod tests {
     use super::*;
 
+    fn corrupt_member(name: &str) -> CacheWrite {
+        let mut entry = CacheWrite::new();
+        entry
+            .zip
+            .start_file(
+                name,
+                FileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+        entry.zip.write_all(b"invalid zstd stream").unwrap();
+        entry
+    }
+
+    #[test]
+    fn capability_diagnostics_distinguish_absent_valid_and_corrupt_members() {
+        for name in ["stdout", "stderr"] {
+            let mut valid = CacheWrite::new();
+            valid.put_bytes(name, b"compiler diagnostic").unwrap();
+            for (entry, expected) in [
+                (CacheWrite::new(), Some(&b""[..])),
+                (valid, Some(&b"compiler diagnostic"[..])),
+                (corrupt_member(name), None),
+            ] {
+                let mut entry = CacheRead::from(Cursor::new(entry.finish().unwrap())).unwrap();
+                let result = if name == "stdout" {
+                    entry.get_stdout()
+                } else {
+                    entry.get_stderr()
+                };
+                match expected {
+                    Some(bytes) => assert_eq!(result.unwrap(), bytes),
+                    None => assert!(result.unwrap_err().is::<DecompressionFailure>()),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_optional_objects_skip_only_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("optional.o");
+        let object = FileObjectSource {
+            key: "optional".into(),
+            path: output.clone(),
+            optional: true,
+        };
+        let pool = tokio::runtime::Handle::current();
+        let absent = CacheWrite::from_objects(vec![object.clone()], &pool)
+            .await
+            .unwrap();
+        CacheRead::from(Cursor::new(absent.finish().unwrap()))
+            .unwrap()
+            .extract_objects(vec![object.clone()], &pool)
+            .await
+            .unwrap();
+        assert!(!output.exists());
+        let mut valid = CacheWrite::new();
+        valid.put_bytes("optional", b"object bytes").unwrap();
+        CacheRead::from(Cursor::new(valid.finish().unwrap()))
+            .unwrap()
+            .extract_objects(vec![object.clone()], &pool)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"object bytes");
+        let corrupt =
+            CacheRead::from(Cursor::new(corrupt_member("optional").finish().unwrap())).unwrap();
+        assert!(
+            corrupt
+                .extract_objects(vec![object], &pool)
+                .await
+                .unwrap_err()
+                .is::<DecompressionFailure>()
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"object bytes");
+        assert!(
+            CacheWrite::from_objects(
+                vec![FileObjectSource {
+                    key: "optional".into(),
+                    path: directory.path().to_path_buf(),
+                    optional: true
+                }],
+                &pool
+            )
+            .await
+            .is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_extract_object_to_devnull_works() {
@@ -383,7 +472,7 @@ mod tests {
             let result = cache_read.extract_objects(objects, pool).await;
             assert!(
                 result.is_ok(),
-                "Extracting to /dev/fd/{raw_fd} should succeed"
+                "Extracting to /dev/fd/{raw_fd} should succeed: {result:?}"
             );
             let mut buf = vec![0; data.len()];
             let n = receiver.read_exact(&mut buf).await.unwrap();

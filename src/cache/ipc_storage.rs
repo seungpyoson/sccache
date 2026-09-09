@@ -72,7 +72,7 @@ impl IpcStorage {
 #[async_trait]
 impl Storage for IpcStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
-        match self.get_path(key).await {
+        match self.get_path(key).await? {
             GetPathResult::Found(path) => {
                 let file = std::fs::File::open(&path)
                     .with_context(|| format!("IpcStorage::get: open {}", path.display()))?;
@@ -87,15 +87,16 @@ impl Storage for IpcStorage {
         }
     }
 
-    async fn get_path(&self, key: &str) -> GetPathResult {
+    async fn get_path(&self, key: &str) -> Result<GetPathResult> {
         match self
             .rpc(Request::StorageGetPath {
                 key: key.to_owned(),
             })
-            .await
+            .await?
         {
-            Ok(Response::StorageGetPath(result)) => result,
-            _ => GetPathResult::Unsupported,
+            Response::StorageGetPath(result) => Ok(result),
+            Response::StorageGetPathError(error) => bail!(error),
+            other => bail!("IpcStorage::get_path: unexpected response: {other:?}"),
         }
     }
 

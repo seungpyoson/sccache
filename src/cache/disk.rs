@@ -132,24 +132,19 @@ impl Storage for DiskCache {
             .await?
     }
 
-    async fn get_path(&self, key: &str) -> GetPathResult {
+    async fn get_path(&self, key: &str) -> Result<GetPathResult> {
         let rel_path = make_key_path(key);
         let lru = self.lru.clone();
         self.pool
             .spawn_blocking(move || {
-                match lru
-                    .lock()
-                    .unwrap()
-                    .get_or_init()
-                    .ok()
-                    .and_then(|c| c.get_abs_path(&rel_path))
-                {
-                    Some(p) => GetPathResult::Found(p),
-                    None => GetPathResult::Miss,
-                }
+                Ok(
+                    match lru.lock().unwrap().get_or_init()?.get_abs_path(&rel_path) {
+                        Some(p) => GetPathResult::Found(p),
+                        None => GetPathResult::Miss,
+                    },
+                )
             })
-            .await
-            .unwrap_or(GetPathResult::Miss)
+            .await?
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
@@ -210,13 +205,18 @@ impl Storage for DiskCache {
     }
     async fn get_preprocessor_cache_entry(&self, key: &str) -> Result<Option<Box<dyn ReadSeek>>> {
         let key = normalize_key(key);
-        Ok(self
+        match self
             .preprocessor_cache
             .lock()
             .unwrap()
             .get_or_init()?
             .get(key)
-            .ok())
+        {
+            Ok(reader) => Ok(Some(reader)),
+            Err(LruError::FileNotInCache) => Ok(None),
+            Err(LruError::Io(error)) => Err(error.into()),
+            Err(error) => Err(anyhow!("preprocessor cache lookup failed: {error:?}")),
+        }
     }
     async fn put_preprocessor_cache_entry(
         &self,

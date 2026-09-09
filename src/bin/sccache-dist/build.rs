@@ -261,7 +261,6 @@ impl OverlayBuilder {
         output_paths: Vec<String>,
         overlay: &OverlaySpec,
     ) -> Result<BuildResult> {
-        trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
             compile_command.executable, compile_command.arguments
@@ -759,7 +758,6 @@ impl DockerBuilder {
         output_paths: Vec<String>,
         cid: &str,
     ) -> Result<BuildResult> {
-        trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
             compile_command.executable, compile_command.arguments

@@ -160,7 +160,6 @@ pub trait CompileCommandImpl: Send + Sync + 'static {
         T: CommandCreatorSync;
 }
 
-#[derive(Debug)]
 pub struct SingleCompileCommand {
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
@@ -610,12 +609,6 @@ where
                     out_pretty,
                     fmt_duration_as_secs(&duration)
                 );
-                let output = process::Output {
-                    status: exit_status(0),
-                    stdout: entry.get_stdout(),
-                    stderr: entry.get_stderr(),
-                };
-
                 let filtered_outputs = if compilation.is_locally_preprocessed() {
                     // In this mode, cache entries are exclusively distinguished by their preprocessed
                     // source contents. But two files may differ in their names and / or the names of
@@ -638,8 +631,18 @@ where
                 };
 
                 let hit = CompileResult::CacheHit(duration);
-                match entry.extract_objects(filtered_outputs, &pool).await {
-                    Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
+                let restored = async {
+                    let output = process::Output {
+                        status: exit_status(0),
+                        stdout: entry.get_stdout()?,
+                        stderr: entry.get_stderr()?,
+                    };
+                    entry.extract_objects(filtered_outputs, &pool).await?;
+                    Ok::<_, Error>(output)
+                }
+                .await;
+                match restored {
+                    Ok(output) => Ok(CacheLookupResult::Success(hit, output)),
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
                             debug!("[{}]: Failed to decompress object", out_pretty);

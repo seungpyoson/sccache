@@ -72,6 +72,8 @@ pub enum Response {
     StorageHandshakeError(String),
     /// A failed raw read is distinct from an absent cache entry.
     StorageGetRawError(String),
+    /// Direct path lookup failed; this is neither absence nor unsupported access.
+    StorageGetPathError(String),
 }
 
 /// Possible responses from the server for a `Compile` request.
@@ -101,7 +103,7 @@ pub struct CompileFinished {
 }
 
 /// The contents of a compile request from a client.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct Compile {
     /// The full path to the compiler executable.
     pub exe: OsString,
@@ -111,6 +113,16 @@ pub struct Compile {
     pub args: Vec<OsString>,
     /// The environment variables present when the compiler was executed, as (var, val).
     pub env_vars: Vec<(OsString, OsString)>,
+}
+
+impl std::fmt::Debug for Compile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Compile")
+            .field("exe", &self.exe)
+            .field("argument_count", &self.args.len())
+            .field("environment_count", &self.env_vars.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Cache metadata returned by the daemon on `StorageHandshake`.

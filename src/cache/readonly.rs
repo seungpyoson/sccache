@@ -25,6 +25,10 @@ pub struct ReadOnlyStorage(pub Arc<dyn Storage>);
 
 #[async_trait]
 impl Storage for ReadOnlyStorage {
+    async fn get_path(&self, key: &str) -> Result<crate::cache::GetPathResult> {
+        self.0.get_path(key).await
+    }
+
     async fn get(&self, key: &str) -> Result<Cache> {
         self.0.get(key).await
     }
@@ -52,6 +56,18 @@ impl Storage for ReadOnlyStorage {
     /// Get the cache backend type name.
     fn cache_type_name(&self) -> &'static str {
         self.0.cache_type_name()
+    }
+
+    fn multilevel_stats(&self) -> Option<crate::cache::multilevel::MultiLevelStats> {
+        self.0.multilevel_stats()
+    }
+
+    fn read_error_count(&self) -> u64 {
+        self.0.read_error_count()
+    }
+
+    fn reset_stats(&self) {
+        self.0.reset_stats();
     }
 
     /// Get the current storage usage, if applicable.

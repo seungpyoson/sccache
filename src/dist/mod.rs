@@ -411,13 +411,23 @@ impl fmt::Display for JobState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompileCommand {
     pub executable: String,
     pub arguments: Vec<String>,
     pub env_vars: Vec<(String, String)>,
     pub cwd: String,
+}
+
+impl fmt::Debug for CompileCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompileCommand")
+            .field("executable", &self.executable)
+            .field("argument_count", &self.arguments.len())
+            .field("environment_count", &self.env_vars.len())
+            .finish_non_exhaustive()
+    }
 }
 
 // process::Output is not serialize so we have a custom Output type. However,

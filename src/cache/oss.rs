@@ -11,7 +11,7 @@
 // limitations under the License.
 
 use opendal::Operator;
-use opendal::layers::{HttpClientLayer, LoggingLayer};
+use opendal::layers::HttpClientLayer;
 use opendal::services::Oss;
 
 use crate::errors::*;
@@ -40,9 +40,9 @@ impl OSSCache {
             builder = builder.allow_anonymous();
         }
 
-        let op = Operator::new(builder)?
+        let op = Operator::new(builder)
+            .map_err(|e| super::RemoteStorage::error("failed to configure oss cache", e))?
             .layer(HttpClientLayer::new(set_user_agent()))
-            .layer(LoggingLayer::default())
             .finish();
         Ok(op)
     }

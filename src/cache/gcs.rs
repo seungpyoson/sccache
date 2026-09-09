@@ -16,10 +16,7 @@
 use crate::cache::CacheMode;
 use crate::errors::*;
 use opendal::Operator;
-use opendal::{
-    layers::{HttpClientLayer, LoggingLayer},
-    services::Gcs,
-};
+use opendal::{layers::HttpClientLayer, services::Gcs};
 use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
@@ -69,13 +66,13 @@ impl GCSCache {
                 .build()
                 .map_err(|e| anyhow!("Failed to create runtime for token fetch: {e}"))?
                 .block_on(fetch_taskcluster_token(cred_url, rw_to_scope(rw_mode)))
-                .map_err(|e| anyhow!("Failed to fetch TaskCluster token: {e}"))?;
+                .context("Failed to fetch TaskCluster token")?;
             builder = builder.token(token);
         }
 
-        let op = Operator::new(builder)?
+        let op = Operator::new(builder)
+            .map_err(|e| super::RemoteStorage::error("failed to configure gcs cache", e))?
             .layer(HttpClientLayer::new(set_user_agent()))
-            .layer(LoggingLayer::default())
             .finish();
         Ok(op)
     }
@@ -91,22 +88,29 @@ impl GCSCache {
 ///
 /// Reference: [gcpCredentials](https://docs.taskcluster.net/docs/reference/platform/auth/api#gcpCredentials)
 async fn fetch_taskcluster_token(url: &str, scope: &str) -> Result<String> {
-    debug!("gcs: start to load token from: {}", url);
+    debug!("gcs: start to load token");
 
     let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    let client = Client::builder().user_agent(user_agent).build()?;
-    let res = client.get(url).send().await?;
+    let client = Client::builder()
+        .user_agent(user_agent)
+        .build()
+        .map_err(|_| anyhow!("failed to configure token HTTP client"))?;
+    let res = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| anyhow!("token HTTP request failed"))?;
 
     if res.status().is_success() {
-        let resp = res.json::<TaskClusterToken>().await?;
+        let resp = res
+            .json::<TaskClusterToken>()
+            .await
+            .map_err(|_| anyhow!("invalid token response"))?;
         debug!("gcs: token load succeeded for scope: {}", scope);
         Ok(resp.access_token)
     } else {
         let status_code = res.status();
-        let content = res.text().await?;
-        Err(anyhow!(
-            "token load failed for: code: {status_code}, {content}"
-        ))
+        Err(anyhow!("token load failed: HTTP {status_code}"))
     }
 }
 

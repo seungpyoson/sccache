@@ -47,18 +47,21 @@ use crate::errors::*;
 pub const DEFAULT_PORT: u16 = 4226;
 
 /// Get the port on which the server should listen.
-fn get_addr() -> crate::net::SocketAddr {
+fn get_addr() -> Result<crate::net::SocketAddr> {
     #[cfg(unix)]
-    if let Ok(addr) = env::var("SCCACHE_SERVER_UDS") {
-        if let Ok(uds) = crate::net::SocketAddr::parse_uds(&addr) {
-            return uds;
-        }
+    if let Some(addr) = env::var_os("SCCACHE_SERVER_UDS") {
+        let addr = addr.to_str().context("SCCACHE_SERVER_UDS must be UTF-8")?;
+        return crate::net::SocketAddr::parse_uds(addr).map_err(Into::into);
     }
-    let port = env::var("SCCACHE_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-    crate::net::SocketAddr::with_port(port)
+    let port = match env::var_os("SCCACHE_SERVER_PORT") {
+        Some(port) => port
+            .to_str()
+            .context("SCCACHE_SERVER_PORT must be UTF-8")?
+            .parse()
+            .context("invalid SCCACHE_SERVER_PORT")?,
+        None => DEFAULT_PORT,
+    };
+    Ok(crate::net::SocketAddr::with_port(port))
 }
 
 /// Check if ignoring all response errors
@@ -176,7 +179,6 @@ fn redirect_error_log(f: File) -> Result<()> {
 /// Re-execute the current executable as a background server.
 #[cfg(windows)]
 fn run_server_process(deadline: Instant) -> Result<ServerStartup> {
-    use futures::StreamExt;
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
@@ -193,6 +195,19 @@ fn run_server_process(deadline: Instant) -> Result<ServerStartup> {
     // Create a mini event loop and register our named pipe server
     let runtime = new_client_runtime()?;
     let pipe_name = &format!(r"\\.\pipe\{}", Uuid::new_v4().as_simple());
+
+    // Own the notification endpoint before the child can attempt to open it.
+    let pipe = {
+        let _guard = runtime.enter();
+        named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .access_inbound(true)
+            .access_outbound(true)
+            .in_buffer_size(65536)
+            .out_buffer_size(65536)
+            .create(pipe_name)?
+    };
 
     // Spawn a server which should come back and connect to us
     let exe_path = env::current_exe()?;
@@ -264,34 +279,9 @@ fn run_server_process(deadline: Instant) -> Result<ServerStartup> {
         return Err(io::Error::last_os_error().into());
     }
 
-    fn create_named_pipe(
-        pipe_name: &str,
-        is_first: bool,
-    ) -> io::Result<named_pipe::NamedPipeServer> {
-        named_pipe::ServerOptions::new()
-            .first_pipe_instance(is_first)
-            .reject_remote_clients(true)
-            .access_inbound(true)
-            .access_outbound(true)
-            .in_buffer_size(65536)
-            .out_buffer_size(65536)
-            .create(pipe_name)
-    }
-
     let startup = async move {
-        let pipe = create_named_pipe(pipe_name, true)?;
-
-        let incoming = futures::stream::try_unfold(pipe, |listener| async move {
-            listener.connect().await?;
-            let new_listener = create_named_pipe(pipe_name, false)?;
-            Ok::<_, io::Error>(Some((listener, new_listener)))
-        });
-
-        futures::pin_mut!(incoming);
-        let socket = incoming.next().await;
-        let socket = socket.unwrap(); // incoming() never returns None
-
-        read_server_startup_status(socket?).await
+        pipe.connect().await?;
+        read_server_startup_status(pipe).await
     };
 
     runtime.block_on(async move {
@@ -704,7 +694,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::ShowStats(fmt, advanced) => {
             trace!("Command::ShowStats({:?})", fmt);
-            let stats = match connect_to_server(&get_addr(), Instant::now() + startup_timeout) {
+            let stats = match connect_to_server(&get_addr()?, Instant::now() + startup_timeout) {
                 Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
                 // If there is no server, spawning a new server would start with zero stats
                 // anyways, so we can just return (mostly) empty stats directly.
@@ -745,6 +735,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         }
         Command::InternalStartServer => {
             trace!("Command::InternalStartServer");
+            let addr = get_addr()?;
             if env::var("SCCACHE_ERROR_LOG").is_ok() {
                 let f = create_error_log()?;
                 // Can't report failure here, we're already daemonized.
@@ -754,10 +745,11 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 // We aren't asking for a log file
                 daemonize()?;
             }
-            server::start_server(config, &get_addr())?;
+            server::start_server(config, &addr)?;
         }
         Command::StartServer => {
             trace!("Command::StartServer");
+            get_addr()?;
             println!("sccache: Starting the server...");
             let startup = run_server_process(Instant::now() + startup_timeout)
                 .context("failed to start server process")?;
@@ -773,14 +765,14 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::StopServer => {
             trace!("Command::StopServer");
             println!("Stopping sccache server...");
-            let server = connect_to_server(&get_addr(), Instant::now() + startup_timeout)
+            let server = connect_to_server(&get_addr()?, Instant::now() + startup_timeout)
                 .context("couldn't connect to server")?;
             let stats = request_shutdown(server)?;
             stats.print(false);
         }
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+            let conn = connect_or_start_server(&get_addr()?, startup_timeout)?;
             request_zero_stats(conn).context("couldn't zero stats on server")?;
             eprintln!("Statistics zeroed.");
         }
@@ -842,7 +834,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         ),
         Command::DistStatus => {
             trace!("Command::DistStatus");
-            let srv = connect_or_start_server(&get_addr(), startup_timeout)?;
+            let srv = connect_or_start_server(&get_addr()?, startup_timeout)?;
             let status =
                 request_dist_status(srv).context("failed to get dist-status from server")?;
             serde_json::to_writer(&mut io::stdout(), &status)?;
@@ -896,7 +888,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 });
 
             let jobserver = Client::new();
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+            let conn = connect_or_start_server(&get_addr()?, startup_timeout)?;
             if config.client_side_mode {
                 // Under make -jN each CLI process gets only 2 worker threads;
                 // one for preprocessing/compilation and one for IPC.  The

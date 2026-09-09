@@ -24,6 +24,18 @@ This creates a cache hierarchy where frequently accessed artifacts stay in fast 
 
 ## Architecture
 
+### Errors and statistics
+
+Every configured level must initialize successfully. A composition remains writable
+when any level is writable; explicitly read-only levels retain their own write
+restriction. A failed read can recover from a later cache hit, but still increments
+`cache_read_errors`. If no level recovers the failure, the lookup returns an error.
+These counts describe backend operations and can overlap compilation cache-error
+counts; they are not a count of units recompiled.
+
+`--zero-stats` resets both server and multilevel counters. Operations completing
+after a reset can contribute to the new interval, including background writes.
+
 ### Cache Hierarchy
 
 ```

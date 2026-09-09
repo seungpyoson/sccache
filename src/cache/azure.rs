@@ -15,7 +15,7 @@
 
 use opendal::Operator;
 
-use opendal::layers::{HttpClientLayer, LoggingLayer};
+use opendal::layers::HttpClientLayer;
 use opendal::services::Azblob;
 
 use crate::errors::*;
@@ -26,13 +26,14 @@ pub struct AzureBlobCache;
 
 impl AzureBlobCache {
     pub fn build(connection_string: &str, container: &str, key_prefix: &str) -> Result<Operator> {
-        let builder = Azblob::from_connection_string(connection_string)?
+        let builder = Azblob::from_connection_string(connection_string)
+            .map_err(|e| super::RemoteStorage::error("invalid azure connection string", e))?
             .container(container)
             .root(key_prefix);
 
-        let op = Operator::new(builder)?
+        let op = Operator::new(builder)
+            .map_err(|e| super::RemoteStorage::error("failed to configure azure cache", e))?
             .layer(HttpClientLayer::new(set_user_agent()))
-            .layer(LoggingLayer::default())
             .finish();
         Ok(op)
     }

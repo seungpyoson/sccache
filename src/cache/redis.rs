@@ -15,7 +15,6 @@
 
 use crate::errors::*;
 use opendal::Operator;
-use opendal::layers::LoggingLayer;
 use opendal::services::Redis;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -47,8 +46,8 @@ impl RedisCache {
             .map(|v| v.parse().unwrap_or_default())
             .unwrap_or_default());
 
-        let op = Operator::new(builder)?
-            .layer(LoggingLayer::default())
+        let op = Operator::new(builder)
+            .map_err(|e| super::RemoteStorage::error("failed to configure redis cache", e))?
             .finish();
         Ok(op)
     }
@@ -98,8 +97,8 @@ impl RedisCache {
             builder = builder.default_ttl(Duration::from_secs(ttl));
         }
 
-        let op = Operator::new(builder)?
-            .layer(LoggingLayer::default())
+        let op = Operator::new(builder)
+            .map_err(|e| super::RemoteStorage::error("failed to configure redis cache", e))?
             .finish();
         Ok(op)
     }

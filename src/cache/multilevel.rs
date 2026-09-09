@@ -123,6 +123,21 @@ impl AtomicLevelStats {
             write_duration: Duration::from_nanos(self.write_duration_nanos.load(Ordering::Relaxed)),
         }
     }
+
+    fn reset(&self) {
+        for counter in [
+            &self.hits,
+            &self.misses,
+            &self.writes,
+            &self.write_failures,
+            &self.backfills_from,
+            &self.backfills_to,
+            &self.hit_duration_nanos,
+            &self.write_duration_nanos,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Statistics for a single cache level (snapshot for display/serialization).
@@ -347,6 +362,7 @@ pub struct MultiLevelStorage {
     write_error_policy: WriteErrorPolicy,
     /// Lock-free atomic statistics per level
     atomic_stats: Vec<Arc<AtomicLevelStats>>,
+    read_errors: AtomicU64,
     /// Base directories for path normalization, propagated to compiler pipeline
     basedirs: Vec<Vec<u8>>,
 }
@@ -385,6 +401,7 @@ impl MultiLevelStorage {
             levels,
             write_error_policy,
             atomic_stats,
+            read_errors: AtomicU64::new(0),
             basedirs,
         }
     }
@@ -632,6 +649,7 @@ impl MultiLevelStorage {
 #[async_trait]
 impl Storage for MultiLevelStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
+        let mut failure = None;
         for (idx, level) in self.levels.iter().enumerate() {
             let start = Instant::now();
             match level.get(key).await {
@@ -646,10 +664,6 @@ impl Storage for MultiLevelStorage {
                         hit_duration_nanos,
                         duration.as_nanos() as u64
                     );
-                    // Mark misses for all levels checked before this hit
-                    for miss_idx in 0..idx {
-                        inc_stat!(self.atomic_stats.get(miss_idx), misses, 1);
-                    }
 
                     // If hit at level > 0, backfill to faster levels (L0 to L(idx-1))
                     if idx > 0 {
@@ -706,6 +720,7 @@ impl Storage for MultiLevelStorage {
                                 );
                             }
                             Err(e) => {
+                                self.read_errors.fetch_add(1, Ordering::Relaxed);
                                 debug!(
                                     "Failed to get raw bytes from level {} for backfill: {}",
                                     hit_level, e
@@ -717,6 +732,7 @@ impl Storage for MultiLevelStorage {
                     return Ok(Cache::Hit(entry));
                 }
                 Ok(Cache::Miss) => {
+                    inc_stat!(self.atomic_stats.get(idx), misses, 1);
                     trace!("Cache miss at level {}, trying next level", idx);
                     continue;
                 }
@@ -724,31 +740,48 @@ impl Storage for MultiLevelStorage {
                     return Ok(other);
                 }
                 Err(e) => {
+                    self.read_errors.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "Error checking cache level {}: {}, trying next level",
                         idx, e
                     );
-                    continue;
+                    failure = Some(e);
                 }
             }
         }
         debug!("Cache miss at all levels");
 
-        // Mark final miss for all checked levels
-        for idx in 0..self.levels.len() {
-            inc_stat!(self.atomic_stats.get(idx), misses, 1);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(Cache::Miss),
         }
-
-        Ok(Cache::Miss)
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        for level in &self.levels {
-            if let Some(bytes) = level.get_raw(key).await? {
-                return Ok(Some(bytes));
+        let mut failure = None;
+        for (idx, level) in self.levels.iter().enumerate() {
+            let start = Instant::now();
+            match level.get_raw(key).await {
+                Ok(Some(bytes)) => {
+                    inc_stat!(self.atomic_stats.get(idx), hits, 1);
+                    inc_stat!(
+                        self.atomic_stats.get(idx),
+                        hit_duration_nanos,
+                        start.elapsed().as_nanos() as u64
+                    );
+                    return Ok(Some(bytes));
+                }
+                Ok(None) => inc_stat!(self.atomic_stats.get(idx), misses, 1),
+                Err(error) => {
+                    self.read_errors.fetch_add(1, Ordering::Relaxed);
+                    failure = Some(error);
+                }
             }
         }
-        Ok(None)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
@@ -877,14 +910,14 @@ impl Storage for MultiLevelStorage {
     }
 
     async fn check(&self) -> Result<CacheMode> {
-        let mut result = CacheMode::ReadWrite;
+        let mut result = CacheMode::ReadOnly;
         for (idx, level) in self.levels.iter().enumerate() {
             match level.check().await {
                 Ok(CacheMode::ReadOnly) => {
-                    result = CacheMode::ReadOnly;
                     debug!("Cache level {} is read-only", idx);
                 }
                 Ok(CacheMode::ReadWrite) => {
+                    result = CacheMode::ReadWrite;
                     trace!("Cache level {} is read-write", idx);
                 }
                 Err(e) => {
@@ -922,6 +955,20 @@ impl Storage for MultiLevelStorage {
 
     fn multilevel_stats(&self) -> Option<crate::cache::multilevel::MultiLevelStats> {
         Some(self.stats())
+    }
+
+    fn read_error_count(&self) -> u64 {
+        self.read_errors.load(Ordering::Relaxed)
+    }
+
+    fn reset_stats(&self) {
+        self.read_errors.store(0, Ordering::Relaxed);
+        for stats in &self.atomic_stats {
+            stats.reset();
+        }
+        for level in &self.levels {
+            level.reset_stats();
+        }
     }
 
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {

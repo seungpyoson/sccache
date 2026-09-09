@@ -481,7 +481,7 @@ pub fn generate_compile_commands(
     ))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NvccCompileCommand {
     pub temp_dir: PathBuf,
     pub keep_dir: Option<PathBuf>,

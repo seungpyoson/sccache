@@ -11,7 +11,7 @@
 // limitations under the License.
 
 use opendal::Operator;
-use opendal::layers::{HttpClientLayer, LoggingLayer};
+use opendal::layers::HttpClientLayer;
 use opendal::services::S3;
 
 use crate::errors::*;
@@ -97,9 +97,9 @@ impl S3Cache {
             builder = builder.server_side_encryption_with_s3_key();
         }
 
-        let op = Operator::new(builder)?
+        let op = Operator::new(builder)
+            .map_err(|e| super::RemoteStorage::error("failed to configure s3 cache", e))?
             .layer(HttpClientLayer::new(set_user_agent()))
-            .layer(LoggingLayer::default())
             .finish();
         Ok(op)
     }
@@ -109,7 +109,7 @@ impl S3Cache {
 fn endpoint_resolver(endpoint: &str, use_ssl: Option<bool>) -> Result<String> {
     let endpoint_uri: http::Uri = endpoint
         .try_into()
-        .map_err(|err| anyhow!("input endpoint {endpoint} is invalid: {:?}", err))?;
+        .context("input S3 endpoint is invalid")?;
     let mut parts = endpoint_uri.into_parts();
     match use_ssl {
         Some(true) => {

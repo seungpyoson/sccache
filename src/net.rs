@@ -71,6 +71,12 @@ impl SocketAddr {
             }
         }
         let path = std::path::PathBuf::from(s);
+        if !path.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SCCACHE_SERVER_UDS must be an absolute path",
+            ));
+        }
         Ok(SocketAddr::Unix(path))
     }
 
@@ -86,6 +92,26 @@ impl SocketAddr {
 }
 
 // A helper trait to unify the behavior of TCP and UDS listener.
+#[cfg(unix)]
+#[test]
+fn capability_socket_paths_have_stable_identity() {
+    for value in ["", "relative.sock", "./sock", "../sock"] {
+        assert_eq!(
+            SocketAddr::parse_uds(value).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+    assert!(matches!(
+        SocketAddr::parse_uds("/absolute.sock").unwrap(),
+        SocketAddr::Unix(_)
+    ));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    assert!(matches!(
+        SocketAddr::parse_uds("\\x00sccache").unwrap(),
+        SocketAddr::UnixAbstract(_)
+    ));
+}
+
 pub trait Acceptor {
     type Socket: AsyncRead + AsyncWrite + Unpin + Send;
 

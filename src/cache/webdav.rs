@@ -12,7 +12,7 @@
 
 use crate::errors::*;
 use opendal::Operator;
-use opendal::layers::{HttpClientLayer, LoggingLayer};
+use opendal::layers::HttpClientLayer;
 use opendal::services::Webdav;
 
 use super::http_client::set_user_agent;
@@ -36,9 +36,9 @@ impl WebdavCache {
             .password(password.unwrap_or_default())
             .token(token.unwrap_or_default());
 
-        let op = Operator::new(builder)?
+        let op = Operator::new(builder)
+            .map_err(|e| super::RemoteStorage::error("failed to configure webdav cache", e))?
             .layer(HttpClientLayer::new(set_user_agent()))
-            .layer(LoggingLayer::default())
             .finish();
         Ok(op)
     }

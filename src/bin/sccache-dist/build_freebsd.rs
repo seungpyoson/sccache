@@ -309,7 +309,6 @@ impl PotBuilder {
         cid: &str,
         pot_fs_root: &Path,
     ) -> Result<BuildResult> {
-        trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
             compile_command.executable, compile_command.arguments

@@ -32,6 +32,7 @@ pub struct MockStorage {
     raw_read: std::result::Result<Option<bytes::Bytes>, &'static str>,
     preprocessor_read_error: Option<&'static str>,
     preprocessor_write_error: Option<&'static str>,
+    preprocessor_reader: Option<fn() -> Box<dyn crate::lru_disk_cache::ReadSeek>>,
 }
 
 impl MockStorage {
@@ -47,6 +48,7 @@ impl MockStorage {
             raw_read: Ok(None),
             preprocessor_read_error: None,
             preprocessor_write_error: None,
+            preprocessor_reader: None,
         }
     }
 
@@ -77,6 +79,14 @@ impl MockStorage {
 
     pub(crate) fn with_preprocessor_write_error(mut self, error: &'static str) -> Self {
         self.preprocessor_write_error = Some(error);
+        self
+    }
+
+    pub(crate) fn with_preprocessor_reader(
+        mut self,
+        reader: fn() -> Box<dyn crate::lru_disk_cache::ReadSeek>,
+    ) -> Self {
+        self.preprocessor_reader = Some(reader);
         self
     }
 }
@@ -115,7 +125,7 @@ impl Storage for MockStorage {
     ) -> Result<Option<Box<dyn crate::lru_disk_cache::ReadSeek>>> {
         match self.preprocessor_read_error {
             Some(error) => Err(anyhow::Error::msg(error)),
-            None => Ok(None),
+            None => Ok(self.preprocessor_reader.map(|reader| reader())),
         }
     }
     async fn put_preprocessor_cache_entry(

@@ -30,6 +30,117 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+#[tokio::test]
+async fn capability_mixed_levels_preserve_writers_and_reject_failed_initialization() {
+    for reader_first in [false, true] {
+        let writer = Arc::new(InMemoryStorage::new());
+        let reader = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
+        let mut levels: Vec<Arc<dyn Storage>> = vec![writer.clone(), reader];
+        if reader_first {
+            levels.reverse();
+        }
+        let storage = MultiLevelStorage::with_write_error_policy(levels, WriteErrorPolicy::All);
+        assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+        storage.put("entry", CacheWrite::default()).await.unwrap();
+        assert!(matches!(writer.get("entry").await.unwrap(), Cache::Hit(_)));
+    }
+    let reader: Arc<dyn Storage> = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
+    assert_eq!(
+        MultiLevelStorage::new(vec![reader.clone(), reader.clone()])
+            .check()
+            .await
+            .unwrap(),
+        CacheMode::ReadOnly
+    );
+    let failed = crate::test::mock_storage::MockStorage::new(None, false)
+        .with_check_error("requested writer unavailable");
+    let storage = MultiLevelStorage::new(vec![reader, Arc::new(failed)]);
+    assert!(storage.check().await.is_err());
+}
+
+#[tokio::test]
+async fn capability_composed_reads_recover_disk_errors_without_hiding_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let invalid_root = directory.path().join("not-a-directory");
+    fs::write(&invalid_root, "retain").unwrap();
+    let broken = DiskCache::new(
+        &invalid_root,
+        u64::MAX,
+        &tokio::runtime::Handle::current(),
+        PreprocessorCacheModeConfig::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    );
+    let lower = Arc::new(InMemoryStorage::new());
+    lower.put("entry", CacheWrite::default()).await.unwrap();
+    let storage = MultiLevelStorage::new(vec![Arc::new(broken), lower]);
+    assert!(matches!(storage.get("entry").await.unwrap(), Cache::Hit(_)));
+    assert!(storage.get_raw("entry").await.unwrap().is_some());
+    assert_eq!(storage.read_error_count(), 2);
+    assert!(storage.get("missing").await.is_err());
+    assert!(storage.get_raw("missing").await.is_err());
+    assert_eq!(storage.read_error_count(), 4);
+    assert_eq!(fs::read_to_string(invalid_root).unwrap(), "retain");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capability_concurrent_read_errors_survive_snapshots_and_reset() {
+    let failed =
+        crate::test::mock_storage::MockStorage::new(None, false).with_raw_read_error("read failed");
+    let lower = Arc::new(InMemoryStorage::new());
+    lower.put("entry", CacheWrite::default()).await.unwrap();
+    let storage = Arc::new(ReadOnlyStorage(Arc::new(MultiLevelStorage::new(vec![
+        Arc::new(failed),
+        lower,
+    ]))));
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let reads = (0..16).map(|_| {
+        let storage = storage.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            storage.get_raw("entry").await
+        })
+    });
+    assert!(
+        futures::future::join_all(reads)
+            .await
+            .into_iter()
+            .all(|r| r.unwrap().unwrap().is_some())
+    );
+    for _ in 0..2 {
+        let info =
+            crate::server::ServerInfo::new(crate::server::ServerStats::default(), Some(&*storage))
+                .await
+                .unwrap();
+        assert_eq!(info.stats.cache_read_errors, 16);
+        assert_eq!(info.stats.multi_level.unwrap().0[1].hits, 16);
+    }
+    storage.reset_stats();
+    assert_eq!(storage.read_error_count(), 0);
+    let stats = storage.multilevel_stats().unwrap();
+    for level in stats.0 {
+        assert_eq!(
+            (
+                level.hits,
+                level.misses,
+                level.writes,
+                level.write_failures,
+                level.backfills_from,
+                level.backfills_to
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            (level.hit_duration, level.write_duration),
+            (Duration::ZERO, Duration::ZERO)
+        );
+    }
+    assert!(storage.get_raw("entry").await.unwrap().is_some());
+    assert_eq!(storage.read_error_count(), 1);
+    assert_eq!(storage.multilevel_stats().unwrap().0[1].hits, 1);
+}
+
 #[test]
 fn test_multi_level_storage_get() {
     let runtime = RuntimeBuilder::new_multi_thread()

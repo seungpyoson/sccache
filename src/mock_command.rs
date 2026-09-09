@@ -258,7 +258,7 @@ impl RunCommand for AsyncCommand {
         let child = inner
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to spawn {:?}", inner))?;
+            .with_context(|| format!("failed to spawn {:?}", inner.as_std().get_program()))?;
 
         Ok(Child {
             inner: child,
@@ -269,7 +269,12 @@ impl RunCommand for AsyncCommand {
 
 impl fmt::Debug for AsyncCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.inner.fmt(f)
+        f.debug_struct("AsyncCommand")
+            .field(
+                "program",
+                &self.inner.as_ref().map(|command| command.get_program()),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -546,6 +551,39 @@ mod test {
     use std::process::{ExitStatus, Output};
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[tokio::test]
+    async fn capability_command_diagnostics_exclude_environment_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command =
+            AsyncCommand::new(directory.path().join("missing-compiler"), Client::new());
+        command.env("TEST_SECRET", "SYNTHETIC_SECRET");
+        assert!(!format!("{command:?}").contains("SYNTHETIC_SECRET"));
+        let error = command
+            .spawn()
+            .await
+            .err()
+            .expect("missing compiler must fail");
+        assert!(!format!("{error:?}").contains("SYNTHETIC_SECRET"));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        let request = crate::protocol::Compile {
+            exe: "compiler".into(),
+            cwd: "/".into(),
+            args: vec![],
+            env_vars: vec![("TEST_SECRET".into(), "SYNTHETIC_SECRET".into())],
+        };
+        assert!(!format!("{request:?}").contains("SYNTHETIC_SECRET"));
+        let distributed = crate::dist::CompileCommand {
+            executable: "compiler".into(),
+            cwd: "/".into(),
+            arguments: vec![],
+            env_vars: vec![("TEST_SECRET".into(), "SYNTHETIC_SECRET".into())],
+        };
+        assert!(!format!("{distributed:?}").contains("SYNTHETIC_SECRET"));
+    }
 
     fn spawn_command<T: CommandCreator, S: AsRef<OsStr>>(
         creator: &mut T,

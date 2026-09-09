@@ -91,6 +91,27 @@ pub fn main() {
     });
 }
 
+// Provider libraries can log response bodies before returning their errors to
+// the cache adapter. Only sccache-authored diagnostics may reach our log sink.
+struct SccacheLogger(env_logger::Logger);
+
+impl log::Log for SccacheLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        (metadata.target() == "sccache" || metadata.target().starts_with("sccache::"))
+            && self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.0.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
 fn init_logging() {
     if env::var(LOGGING_ENV).is_ok() {
         let mut builder = env_logger::Builder::from_env(LOGGING_ENV);
@@ -100,8 +121,10 @@ fn init_logging() {
             builder.format_timestamp_millis();
         }
 
-        match builder.try_init() {
-            Ok(_) => (),
+        let logger = builder.build();
+        let level = logger.filter();
+        match log::set_boxed_logger(Box::new(SccacheLogger(logger))) {
+            Ok(_) => log::set_max_level(level),
             Err(e) => panic!("Failed to initialize logging: {:?}", e),
         }
     }

@@ -206,7 +206,7 @@ impl<'a> Deserialize<'a> for HTTPUrl {
 fn parse_http_url(url: &str) -> Result<reqwest::Url> {
     use std::net::SocketAddr;
     let url = if let Ok(sa) = url.parse::<SocketAddr>() {
-        warn!("Url {} has no scheme, assuming http", url);
+        warn!("URL has no scheme, assuming http");
         reqwest::Url::parse(&format!("http://{}", sa))
     } else {
         reqwest::Url::parse(url)
@@ -813,14 +813,51 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     }
 
     let res = if path.extension().is_some_and(|e| e == "json") {
-        serde_json::from_str(&string)
-            .with_context(|| format!("Failed to load json config file from {}", path.display()))?
+        serde_json::from_str(&string).map_err(|error| {
+            anyhow!(
+                "Failed to load json config file from {}: {:?} at line {}, column {}",
+                path.display(),
+                error.classify(),
+                error.line(),
+                error.column()
+            )
+        })?
     } else {
         toml::from_str(&string)
-            .with_context(|| format!("Failed to load toml config file from {}", path.display()))?
+            .map_err(|error: toml::de::Error| anyhow!("Failed to load toml config file from {}: invalid syntax or value at byte range {:?}",
+                path.display(), error.span()))?
     };
 
     Ok(Some(res))
+}
+
+#[test]
+fn capability_config_parse_errors_do_not_echo_contents() {
+    let directory = tempfile::tempdir().unwrap();
+    for (extension, invalid) in [
+        ("toml", "[cache.redis]\npassword = \"SYNTHETIC_SECRET"),
+        ("toml", "client_side_mode = \"SYNTHETIC_SECRET\""),
+        ("json", "{\"client_side_mode\":\"SYNTHETIC_SECRET\"}"),
+    ] {
+        let path = directory.path().join(format!("config.{extension}"));
+        std::fs::write(&path, invalid).unwrap();
+        let error = try_read_config_file::<FileConfig>(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Failed to load {extension} config file"))
+        );
+        assert!(!format!("{error:?}").contains("SYNTHETIC_SECRET"));
+        assert_eq!(error.chain().count(), 1);
+    }
+    let path = directory.path().join("valid.toml");
+    std::fs::write(&path, "client_side_mode = true").unwrap();
+    assert!(
+        try_read_config_file::<FileConfig>(&path)
+            .unwrap()
+            .unwrap()
+            .client_side_mode
+    );
 }
 
 #[derive(Debug)]
