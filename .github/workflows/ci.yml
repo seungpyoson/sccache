@@ -59,6 +59,9 @@ jobs:
 
 
   test:
+    permissions:
+      contents: read
+      id-token: write
     name: test ${{ matrix.os }} rust ${{ matrix.rustc || 'stable' }} ${{ matrix.extra_desc }}
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.allow_failure || false }}
@@ -236,14 +239,13 @@ jobs:
         if: ${{ ! matrix.no_coverage }}
         uses: codecov/codecov-action@v5
         with:
+          use_oidc: true
           files: ${{ steps.coverage.outputs.report }}
           ## flags: IntegrationTests, UnitTests, ${{ steps.vars.outputs.CODECOV_FLAGS }}
           flags: ${{ steps.vars.outputs.CODECOV_FLAGS }}
           name: codecov-umbrella-${{ matrix.os }}-rust_${{ matrix.rustc || 'stable' }}-${{ matrix.extra_desc }}
           fail_ci_if_error: true
           # verbose: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
 
 

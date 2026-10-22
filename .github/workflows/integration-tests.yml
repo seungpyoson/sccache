@@ -34,6 +34,9 @@ jobs:
           path: ./target/debug/sccache
 
   integration-tests:
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -67,12 +70,11 @@ jobs:
       - name: Upload coverage results (to Codecov.io)
         uses: codecov/codecov-action@v5
         with:
+          use_oidc: true
           files: target/integration-coverage/reports/lcov.info
           name: codecov-umbrella-integration-${{ matrix.type }}
           fail_ci_if_error: true
           # verbose: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   gha:
     runs-on: ubuntu-24.04
